@@ -18,8 +18,6 @@ def setup_pinmux():
     os.system("sudo busybox devmem 0x2430068 w 0x8")
     os.system("sudo busybox devmem 0x243D028 w 0x1005")
     os.system("sudo busybox devmem 0x243D018 w 0x5")
-    for cmd in cmds:
-        subprocess.run(f"sudo {cmd}", shell=True, check=False)
 
 class MotorControlNode(Node):
     def __init__(self):
