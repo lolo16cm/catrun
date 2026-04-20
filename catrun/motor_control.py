@@ -6,11 +6,11 @@ import Jetson.GPIO as GPIO
 import subprocess
 
 # Board pin numbers
-IN1 = 32
-IN2 = 33
-IN3 = 35
-IN4 = 36
-
+# Board pin numbers
+IN1 = 31
+IN2 = 29
+IN3 = 23
+IN4 = 21
 def setup_pinmux():
     """Configure pinmux for GPIO output mode"""
     cmds = [
