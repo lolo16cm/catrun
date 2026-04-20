@@ -26,6 +26,7 @@ setup(
     'console_scripts': [
         'cat_detection = catrun.cat_detection:main',
         'motor_control = catrun.motor_control:main',
+        'navigation = catrun.navigation:main',
     ],
 },
 )
