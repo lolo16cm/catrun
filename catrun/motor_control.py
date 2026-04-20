@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
+
 import rclpy
-import os
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 import Jetson.GPIO as GPIO
-import subprocess
+import os
+import time
 
-# Board pin numbers
-# Board pin numbers
-IN1 = 31
-IN2 = 29
-IN3 = 23
-IN4 = 21
+# BOARD pin numbers - Jetson Orin Nano safe GPIO pins
+IN1 = 29  # PQ.05
+IN2 = 31  # PQ.06
+IN3 = 32  # PG.06
+IN4 = 33  # PH.00
+
 def setup_pinmux():
-    """Configure pinmux for GPIO output mode"""
-    os.system("sudo busybox devmem 0x2430070 w 0x8")
-    os.system("sudo busybox devmem 0x2430068 w 0x8")
-    os.system("sudo busybox devmem 0x243D028 w 0x1005")
-    os.system("sudo busybox devmem 0x243D018 w 0x5")
+    os.system("sudo busybox devmem 0x2430068 w 0x5")  # PIN 29
+    os.system("sudo busybox devmem 0x2430070 w 0x5")  # PIN 31
+    os.system("sudo busybox devmem 0x2434080 w 0x5")  # PIN 32
+    os.system("sudo busybox devmem 0x2434040 w 0x5")  # PIN 33
+    time.sleep(0.5)
 
 class MotorControlNode(Node):
     def __init__(self):
         super().__init__('motor_control')
 
-        # Setup pinmux first
         setup_pinmux()
 
-        # Setup GPIO
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(IN1, GPIO.OUT)
         GPIO.setup(IN2, GPIO.OUT)
@@ -34,7 +33,6 @@ class MotorControlNode(Node):
         GPIO.setup(IN4, GPIO.OUT)
         self.stop()
 
-        # Subscribe to cmd_vel
         self.sub = self.create_subscription(
             Twist,
             '/cmd_vel',
