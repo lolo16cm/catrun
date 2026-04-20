@@ -61,7 +61,7 @@ def generate_launch_description():
 
         # Motor control (delayed 5s)
         TimerAction(
-            period=5.0,
+            period=30.0,
             actions=[
                 Node(
                     package='catrun',

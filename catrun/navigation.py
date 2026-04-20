@@ -8,13 +8,11 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 import math
 import time
 
-# ─── Define your waypoints here ───────────────────────────
 WAYPOINTS = {
-    'L1': (-0.00548, -0.0158,  0.0),   # Start point
-    'L2': (3.19,      1.16,    0.0),   # Middle point
-    'L3': (-0.157,   -2.81,    0.0),   # End point
+    'L1': (-0.00548, -0.0158,  0.0),
+    'L2': (3.19,      1.16,    0.0),
+    'L3': (-0.157,   -2.81,    0.0),
 }
-# ──────────────────────────────────────────────────────────
 
 class NavigationNode(Node):
     def __init__(self):
@@ -37,53 +35,73 @@ class NavigationNode(Node):
         msg.pose.covariance[0]  = 0.25
         msg.pose.covariance[7]  = 0.25
         msg.pose.covariance[35] = 0.07
-        # Publish multiple times to make sure it's received
         for _ in range(5):
             self.initial_pose_pub.publish(msg)
             time.sleep(0.5)
         self.get_logger().info('Initial pose set!')
 
-    def navigate_to(self, x, y, yaw_deg=0.0, label='goal'):
-        self.get_logger().info(f'Navigating to {label}: ({x}, {y})')
-        self.client.wait_for_server()
+    def navigate_to(self, x, y, yaw_deg=0.0, label='goal', retries=3):
+        for attempt in range(retries):
+            self.get_logger().info(
+                f'Navigating to {label}: ({x}, {y}) attempt {attempt+1}/{retries}')
 
-        goal = NavigateToPose.Goal()
-        goal.pose = PoseStamped()
-        goal.pose.header.frame_id = 'map'
-        goal.pose.header.stamp = self.get_clock().now().to_msg()
-        goal.pose.pose.position.x = x
-        goal.pose.pose.position.y = y
+            if not self.client.wait_for_server(timeout_sec=10.0):
+                self.get_logger().error('Nav2 action server not available!')
+                return False
 
-        yaw = math.radians(yaw_deg)
-        goal.pose.pose.orientation.z = math.sin(yaw / 2)
-        goal.pose.pose.orientation.w = math.cos(yaw / 2)
+            goal = NavigateToPose.Goal()
+            goal.pose = PoseStamped()
+            goal.pose.header.frame_id = 'map'
+            goal.pose.header.stamp = self.get_clock().now().to_msg()
+            goal.pose.pose.position.x = x
+            goal.pose.pose.position.y = y
+            yaw = math.radians(yaw_deg)
+            goal.pose.pose.orientation.z = math.sin(yaw / 2)
+            goal.pose.pose.orientation.w = math.cos(yaw / 2)
 
-        future = self.client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, future)
-        goal_handle = future.result()
+            future = self.client.send_goal_async(goal)
+            rclpy.spin_until_future_complete(self, future)
+            goal_handle = future.result()
 
-        if not goal_handle.accepted:
-            self.get_logger().warn(f'Goal {label} rejected!')
-            return False
+            if not goal_handle.accepted:
+                self.get_logger().warn(
+                    f'Goal {label} rejected! Retrying in 2s...')
+                time.sleep(2.0)
+                continue
 
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
-        self.get_logger().info(f'Reached {label}!')
-        return True
+            self.get_logger().info(f'Goal {label} accepted! Waiting...')
+            result_future = goal_handle.get_result_async()
+            rclpy.spin_until_future_complete(self, result_future)
+
+            status = result_future.result().status
+            if status == 4:  # SUCCEEDED
+                self.get_logger().info(f'✅ Reached {label}!')
+                return True
+            else:
+                self.get_logger().warn(
+                    f'Goal {label} failed with status {status}. Retrying...')
+                time.sleep(2.0)
+
+        self.get_logger().error(
+            f'❌ Failed to reach {label} after {retries} attempts!')
+        return False
 
     def run_mission(self):
-        # Set initial pose first
         self.set_initial_pose(-0.00548, -0.0158)
-        # Wait for AMCL to localize
         self.get_logger().info('Waiting for Nav2 to be ready...')
         time.sleep(5.0)
 
-        # L1 → L2 → L3 → L1
-        self.navigate_to(*WAYPOINTS['L1'], label='L1 start')
-        self.navigate_to(*WAYPOINTS['L2'], label='L2')
-        self.navigate_to(*WAYPOINTS['L3'], label='L3')
-        self.navigate_to(*WAYPOINTS['L1'], label='L1 return')
-        self.get_logger().info('Mission complete!')
+        results = []
+        results.append(self.navigate_to(*WAYPOINTS['L1'], label='L1 start'))
+        results.append(self.navigate_to(*WAYPOINTS['L2'], label='L2'))
+        results.append(self.navigate_to(*WAYPOINTS['L3'], label='L3'))
+        results.append(self.navigate_to(*WAYPOINTS['L1'], label='L1 return'))
+
+        if all(results):
+            self.get_logger().info('✅ Mission complete! All waypoints reached!')
+        else:
+            self.get_logger().error(
+                '❌ Mission failed! Some waypoints not reached!')
 
 
 def main(args=None):

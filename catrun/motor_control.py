@@ -3,29 +3,32 @@
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
 import Jetson.GPIO as GPIO
 import os
 import time
 
-# BOARD pin numbers - Jetson Orin Nano safe GPIO pins
-IN1 = 29  # PQ.05
-IN2 = 31  # PQ.06
-IN3 = 32  # PG.06
-IN4 = 33  # PH.00
+# Board pin numbers
+IN1 = 31
+IN2 = 29
+IN3 = 32
+IN4 = 33
 
-def setup_pinmux():
-    os.system("sudo busybox devmem 0x2430068 w 0x5")  # PIN 29
-    os.system("sudo busybox devmem 0x2430070 w 0x5")  # PIN 31
-    os.system("sudo busybox devmem 0x2434080 w 0x5")  # PIN 32
-    os.system("sudo busybox devmem 0x2434040 w 0x5")  # PIN 33
-    time.sleep(0.5)
+SAFE_DISTANCE = 0.25  # meters - stop if obstacle closer than this
+SLOW_DISTANCE = 0.45  # meters - slow down if obstacle closer than this
 
 class MotorControlNode(Node):
     def __init__(self):
         super().__init__('motor_control')
 
-        setup_pinmux()
+        # Setup pinmux
+        os.system("sudo busybox devmem 0x2430068 w 0x5")
+        os.system("sudo busybox devmem 0x2430070 w 0x5")
+        os.system("sudo busybox devmem 0x2434080 w 0x5")
+        os.system("sudo busybox devmem 0x2434040 w 0x5")
+        time.sleep(0.5)
 
+        # Setup GPIO
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(IN1, GPIO.OUT)
         GPIO.setup(IN2, GPIO.OUT)
@@ -33,13 +36,29 @@ class MotorControlNode(Node):
         GPIO.setup(IN4, GPIO.OUT)
         self.stop()
 
+        self.front_distance = float('inf')
+
+        # Subscribe to cmd_vel
         self.sub = self.create_subscription(
-            Twist,
-            '/cmd_vel',
-            self.cmd_vel_callback,
-            10)
+            Twist, '/cmd_vel', self.cmd_vel_callback, 10)
+
+        # Subscribe to LiDAR scan for obstacle detection
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, 10)
 
         self.get_logger().info('Motor Control Node started!')
+
+    def scan_callback(self, msg):
+        ranges = msg.ranges
+        n = len(ranges)
+        # Check front ±30 degrees
+        front_indices = list(range(0, n//12)) + list(range(11*n//12, n))
+        front_ranges = [ranges[i] for i in front_indices 
+                       if 0.05 < ranges[i] < 10.0 and ranges[i] != float('inf')]
+        if front_ranges:
+            self.front_distance = min(front_ranges)
+        else:
+            self.front_distance = float('inf')
 
     def forward(self):
         GPIO.output(IN1, GPIO.HIGH)
@@ -75,9 +94,17 @@ class MotorControlNode(Node):
         linear  = msg.linear.x
         angular = msg.angular.z
 
+        # Obstacle check — only block forward movement
+        if linear > 0.1 and self.front_distance < SAFE_DISTANCE:
+            self.stop()
+            self.get_logger().warn(
+                f'OBSTACLE! front={self.front_distance:.2f}m STOP')
+            return
+
         if linear > 0.1:
             self.forward()
-            self.get_logger().info('FORWARD')
+            self.get_logger().info(
+                f'FORWARD front={self.front_distance:.2f}m')
         elif linear < -0.1:
             self.backward()
             self.get_logger().info('BACKWARD')
@@ -95,6 +122,7 @@ class MotorControlNode(Node):
         self.stop()
         GPIO.cleanup()
         super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
