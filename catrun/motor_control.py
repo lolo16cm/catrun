@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 import Jetson.GPIO as GPIO
+import subprocess
 
 # Board pin numbers
 IN1 = 32
@@ -11,9 +11,23 @@ IN2 = 33
 IN3 = 35
 IN4 = 36
 
+def setup_pinmux():
+    """Configure pinmux for GPIO output mode"""
+    cmds = [
+        "busybox devmem 0x2430070 w 0x8",
+        "busybox devmem 0x2430068 w 0x8",
+        "busybox devmem 0x243D028 w 0x1005",
+        "busybox devmem 0x243D018 w 0x5",
+    ]
+    for cmd in cmds:
+        subprocess.run(f"sudo {cmd}", shell=True, check=False)
+
 class MotorControlNode(Node):
     def __init__(self):
         super().__init__('motor_control')
+
+        # Setup pinmux first
+        setup_pinmux()
 
         # Setup GPIO
         GPIO.setmode(GPIO.BOARD)
@@ -45,14 +59,12 @@ class MotorControlNode(Node):
         GPIO.output(IN4, GPIO.HIGH)
 
     def turn_left(self):
-        # Left motors backward, right motors forward
         GPIO.output(IN1, GPIO.HIGH)
         GPIO.output(IN2, GPIO.LOW)
         GPIO.output(IN3, GPIO.LOW)
         GPIO.output(IN4, GPIO.HIGH)
 
     def turn_right(self):
-        # Left motors forward, right motors backward
         GPIO.output(IN1, GPIO.LOW)
         GPIO.output(IN2, GPIO.HIGH)
         GPIO.output(IN3, GPIO.HIGH)
@@ -88,7 +100,6 @@ class MotorControlNode(Node):
         self.stop()
         GPIO.cleanup()
         super().destroy_node()
-
 
 def main(args=None):
     rclpy.init(args=args)
