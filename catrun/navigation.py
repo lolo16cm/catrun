@@ -9,10 +9,10 @@ import math
 import time
 
 WAYPOINTS = {
-    'L1': (-1.68,   -1.14,    0.0),
-    'L2': (-1.0,   -1.0,    0.0),
-    'L3': (-0.5,   -0.5,    0.0),
-    'L4': (0.0,  0.0,   0.0),
+    'L1': (-1.68,  -1.14,  0.0),
+    'L2': (-1.0,   -1.0,   0.0),
+    'L3': (-0.5,   -0.5,   0.0),
+    'L4': (0.0,     0.0,   0.0),
 }
 
 class NavigationNode(Node):
@@ -94,8 +94,12 @@ class NavigationNode(Node):
         return False
 
     def run_mission(self):
-        self.set_initial_pose(WAYPOINTS['L1'][0], WAYPOINTS['L1'][1])
+        # Wait for Nav2 first
         self.wait_for_nav2()
+        time.sleep(3.0)
+
+        # Then set initial pose
+        self.set_initial_pose(WAYPOINTS['L1'][0], WAYPOINTS['L1'][1])
         time.sleep(5.0)
 
         results = []
