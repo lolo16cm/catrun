@@ -10,8 +10,8 @@ import time
 
 WAYPOINTS = {
     'L1': (-0.0108, -0.0029,  0.0),
-    'L2': (-2.22,      3.91,    0.0),
-    'L3': (1.53,   3.19,    0.0),
+    'L2': (-2.22,    3.91,    0.0),
+    'L3': (1.53,     3.19,    0.0),
 }
 
 class NavigationNode(Node):
@@ -40,6 +40,13 @@ class NavigationNode(Node):
             time.sleep(0.5)
         self.get_logger().info('Initial pose set!')
 
+    def wait_for_nav2(self):
+        self.get_logger().info('Waiting for Nav2 to be ready...')
+        # Wait for action server
+        while not self.client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().info('Nav2 not ready, waiting...')
+        self.get_logger().info('Nav2 is ready!')
+
     def navigate_to(self, x, y, yaw_deg=0.0, label='goal', retries=3):
         for attempt in range(retries):
             self.get_logger().info(
@@ -65,8 +72,8 @@ class NavigationNode(Node):
 
             if not goal_handle.accepted:
                 self.get_logger().warn(
-                    f'Goal {label} rejected! Retrying in 2s...')
-                time.sleep(2.0)
+                    f'Goal {label} rejected! Retrying in 3s...')
+                time.sleep(3.0)
                 continue
 
             self.get_logger().info(f'Goal {label} accepted! Waiting...')
@@ -80,15 +87,18 @@ class NavigationNode(Node):
             else:
                 self.get_logger().warn(
                     f'Goal {label} failed with status {status}. Retrying...')
-                time.sleep(2.0)
+                time.sleep(3.0)
 
         self.get_logger().error(
             f'❌ Failed to reach {label} after {retries} attempts!')
         return False
 
     def run_mission(self):
-        self.set_initial_pose(-0.00548, -0.0158)
-        self.get_logger().info('Waiting for Nav2 to be ready...')
+        # Use L1 coordinates as initial pose
+        self.set_initial_pose(WAYPOINTS['L1'][0], WAYPOINTS['L1'][1])
+
+        # Wait for Nav2 to be fully ready
+        self.wait_for_nav2()
         time.sleep(5.0)
 
         results = []
