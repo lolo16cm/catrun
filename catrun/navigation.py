@@ -94,7 +94,7 @@ class NavigationNode(Node):
         return False
 
     def run_mission(self):
-        self.set_initial_pose(0.0, 0.0)
+        self.set_initial_pose(WAYPOINTS['L1'][0], WAYPOINTS['L1'][1])
         self.wait_for_nav2()
         time.sleep(5.0)
 
