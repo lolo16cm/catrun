@@ -9,9 +9,10 @@ import math
 import time
 
 WAYPOINTS = {
-    'L1': (0.0, 0.0,  0.0),
-    'L2': (2.31,    0.48,    0.0),
-    'L3': (1.95,    2.2,    0.0),
+    'L1': (0.0,   0.0,    0.0),
+    'L2': (2.05,  -0.075, 0.0),
+    'L3': (-0.3,  0.5,    0.0),
+    'L4': (-2.6,  -0.6,   0.0),
 }
 
 class NavigationNode(Node):
@@ -42,7 +43,6 @@ class NavigationNode(Node):
 
     def wait_for_nav2(self):
         self.get_logger().info('Waiting for Nav2 to be ready...')
-        # Wait for action server
         while not self.client.wait_for_server(timeout_sec=5.0):
             self.get_logger().info('Nav2 not ready, waiting...')
         self.get_logger().info('Nav2 is ready!')
@@ -94,10 +94,7 @@ class NavigationNode(Node):
         return False
 
     def run_mission(self):
-        # Use L1 coordinates as initial pose
-        self.set_initial_pose(WAYPOINTS['L1'][0], WAYPOINTS['L1'][1])
-
-        # Wait for Nav2 to be fully ready
+        self.set_initial_pose(0.0, 0.0)
         self.wait_for_nav2()
         time.sleep(5.0)
 
@@ -105,13 +102,13 @@ class NavigationNode(Node):
         results.append(self.navigate_to(*WAYPOINTS['L1'], label='L1 start'))
         results.append(self.navigate_to(*WAYPOINTS['L2'], label='L2'))
         results.append(self.navigate_to(*WAYPOINTS['L3'], label='L3'))
+        results.append(self.navigate_to(*WAYPOINTS['L4'], label='L4'))
         results.append(self.navigate_to(*WAYPOINTS['L1'], label='L1 return'))
 
         if all(results):
             self.get_logger().info('✅ Mission complete! All waypoints reached!')
         else:
-            self.get_logger().error(
-                '❌ Mission failed! Some waypoints not reached!')
+            self.get_logger().error('❌ Mission failed! Some waypoints not reached!')
 
 
 def main(args=None):
