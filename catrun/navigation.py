@@ -9,7 +9,7 @@ import math
 import time
 
 WAYPOINTS = {
-    'L1': (-1.68,  -1.14,  0.0),
+    'L1': (0.726,  0.831,  0.0),  # current robot position
     'L2': (-1.0,   -1.0,   0.0),
     'L3': (-0.5,   -0.5,   0.0),
     'L4': (0.0,     0.0,   0.0),
