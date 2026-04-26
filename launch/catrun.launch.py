@@ -12,19 +12,19 @@ def generate_launch_description():
 
     return LaunchDescription([
 
-        # Static TF base_link -> laser
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            arguments=['0', '0', '0.1', '0', '0', '0', 'base_link', 'laser'],
-        ),
-
-        # Static TF base_link -> base_footprint
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'base_footprint'],
-        ),
+	# Robot state publisher (handles all TF from URDF)
+	Node(
+	    package='robot_state_publisher',
+	    executable='robot_state_publisher',
+	    parameters=[{
+	        'robot_description': open(
+	            os.path.join(
+	                get_package_share_directory('catrun'),
+	                'urdf', 'robot.urdf'
+	            )
+	        ).read()
+	    }]
+	),	
 
         # RPLiDAR
         Node(
@@ -56,6 +56,8 @@ def generate_launch_description():
             launch_arguments={
                 'map': map_file,
                 'use_sim_time': 'false',
+		'params_file': os.path.join(
+        get_package_share_directory('catrun'), 'map', 'nav2_params.yaml'),
             }.items(),
         ),
 

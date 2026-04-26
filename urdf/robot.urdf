@@ -1,0 +1,54 @@
+<?xml version="1.0"?>
+<robot name="catrun">
+
+  <!-- base_footprint: ground projection of robot center -->
+  <link name="base_footprint"/>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0.0 0.0 0.18" rpy="0 0 0"/>
+  </joint>
+
+  <!-- base_link: center of robot body -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.220 0.175 0.195"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.2 0.4 0.8 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.220 0.175 0.195"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- laser: LiDAR mounted top front -->
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser"/>
+    <!-- x=0.08 (front), z=0.097+0.02 (top of body + small offset) -->
+    <origin xyz="0.08 0 0.1175" rpy="0 0 3.14159"/>
+  </joint>
+
+  <link name="laser">
+    <visual>
+      <geometry>
+        <cylinder length="0.04" radius="0.04"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder length="0.04" radius="0.04"/>
+      </geometry>
+    </collision>
+  </link>
+
+</robot>

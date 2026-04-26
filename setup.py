@@ -1,6 +1,6 @@
 from setuptools import setup
-import os
 from glob import glob
+import os
 
 package_name = 'catrun'
 
@@ -15,7 +15,8 @@ setup(
         ('share/' + package_name + '/launch',
             glob('launch/*.py')),
         ('share/' + package_name + '/map',
-            glob('map/*')),
+            glob('map/*.pgm') + glob('map/*.yaml')),
+	    (os.path.join('share', package_name, 'urdf'), glob('urdf/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,7 +26,9 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'cat_detection = catrun.cat_detection:main',
+            'camera_node = catrun.camera_node:main',
+            'cat_detector = catrun.cat_detector:main',
+	    'flee_behavior = catrun.flee_behavior:main',
             'motor_control = catrun.motor_control:main',
             'navigation = catrun.navigation:main',
         ],

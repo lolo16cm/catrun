@@ -1,0 +1,15 @@
+build/
+install/
+log/
+__pycache__/
+*.pyc
+catrun/build/
+catrun/install/
+catrun/log/
+catrun/__pycache__/
+map/build/
+map/install/
+map/log/
+*.gv
+*.pdf
+*.deb
