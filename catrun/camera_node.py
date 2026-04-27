@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -7,23 +8,30 @@ import cv2
 class CameraNode(Node):
     def __init__(self):
         super().__init__('camera_node')
-        
+
         self.bridge = CvBridge()
         self.pub = self.create_publisher(Image, '/camera/catrun', 10)
-        
-        # IMX477 GStreamer pipeline
-        self.pipeline = "nvarguscamerasrc sensor-id=0 ! video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! nvvidconv flip-method=2 ! video/x-raw, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink drop=1"
-        
+
+        # IMX477 GStreamer pipeline — 1920x1080 @ 60fps (matches sensor mode 2)
+        self.pipeline = (
+            "nvarguscamerasrc sensor-id=0 ! "
+            "video/x-raw(memory:NVMM), width=1920, height=1080, framerate=60/1 ! "
+            "nvvidconv flip-method=2 ! "
+            "video/x-raw, format=BGRx ! "
+            "videoconvert ! "
+            "video/x-raw, format=BGR ! "
+            "appsink drop=1"
+        )
+
         self.cap = cv2.VideoCapture(self.pipeline, cv2.CAP_GSTREAMER)
-        
+
         if not self.cap.isOpened():
             self.get_logger().error('❌ Camera failed to open!')
             return
-            
+
         self.get_logger().info('✅ IMX477 camera opened!')
         self.get_logger().info('Publishing to /camera/catrun')
-        
-        # Publish at 30fps
+
         self.timer = self.create_timer(1.0/30.0, self.timer_callback)
 
     def timer_callback(self):
@@ -31,7 +39,7 @@ class CameraNode(Node):
         if not ret or frame is None:
             self.get_logger().warn('⚠️ Failed to grab frame')
             return
-        
+
         msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'camera'
