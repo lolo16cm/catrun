@@ -26,11 +26,15 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'camera_node = catrun.camera_node:main',
-            'cat_detector = catrun.cat_detector:main',
-	        'flee_behavior = catrun.flee_behavior:main',
+            
             'motor_control = catrun.motor_control:main',
             'navigation = catrun.navigation:main',
+            'flee_behavior = catrun.flee_behavior:main',
+
+            'camera_node = catrun.camera_node:main',
+            'web_stream = catrun.web_stream:main',
+            'cat_detector = catrun.cat_detector:main',
+            'seek_cat = catrun.seek_cat:main',
         ],
     },
 )

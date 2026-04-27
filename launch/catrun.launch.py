@@ -12,19 +12,19 @@ def generate_launch_description():
 
     return LaunchDescription([
 
-	# Robot state publisher (handles all TF from URDF)
-	Node(
-	    package='robot_state_publisher',
-	    executable='robot_state_publisher',
-	    parameters=[{
-	        'robot_description': open(
-	            os.path.join(
-	                get_package_share_directory('catrun'),
-	                'urdf', 'robot.urdf'
-	            )
-	        ).read()
-	    }]
-	),	
+        # Robot state publisher
+        Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            parameters=[{
+                'robot_description': open(
+                    os.path.join(
+                        get_package_share_directory('catrun'),
+                        'urdf', 'robot.urdf'
+                    )
+                ).read()
+            }]
+        ),
 
         # RPLiDAR
         Node(
@@ -56,14 +56,15 @@ def generate_launch_description():
             launch_arguments={
                 'map': map_file,
                 'use_sim_time': 'false',
-		'params_file': os.path.join(
-        get_package_share_directory('catrun'), 'map', 'nav2_params.yaml'),
+                'params_file': os.path.join(
+                    get_package_share_directory('catrun'),
+                    'map', 'nav2_params.yaml'),
             }.items(),
         ),
 
-        # Motor control (delayed 5s)
+        # Motor control (delayed 10s to wait for Nav2 to start)
         TimerAction(
-            period=30.0,
+            period=10.0,
             actions=[
                 Node(
                     package='catrun',
@@ -73,15 +74,4 @@ def generate_launch_description():
             ]
         ),
 
-        # Navigation (delayed 15s to wait for Nav2)
-        TimerAction(
-            period=15.0,
-            actions=[
-                Node(
-                    package='catrun',
-                    executable='navigation',
-                    output='screen',
-                ),
-            ]
-        ),
     ])

@@ -11,12 +11,13 @@ import os
 DATASET_DIR = os.path.expanduser('~/cat_dataset/train')
 VAL_DIR     = os.path.expanduser('~/cat_dataset/val')
 OUTPUT_PATH = os.path.expanduser('~/cat_classifier.pth')
-EPOCHS      = 30
-BATCH_SIZE  = 32
-LR          = 0.0005
+EPOCHS      = 50 #how many times the model sees the entire dataset.
+BATCH_SIZE  = 16 # how many photos are processed at once. Smaller batch = the model updates its weights more carefully and precisely
+LR          = 0.0001 # how many photos are processed at once. Smaller batch = the model updates its weights more carefully and precisely
 
+#resizes photos to 320x320 before cropping to 224x224. Larger starting size = more detail preserved, especially important for the small white nose patch on pichu.
 train_transform = T.Compose([
-    T.Resize((256, 256)),
+    T.Resize((320, 320)),
     T.RandomCrop(224),
     T.RandomHorizontalFlip(),
     T.RandomVerticalFlip(),
