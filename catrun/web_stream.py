@@ -1,309 +1,331 @@
 #!/usr/bin/env python3
 """
-cat_detector.py
-Runs YOLOv8 + MobileNetV2 to identify cats (eevee / pichu / raichu).
+web_stream.py
+Phone-accessible web UI for the cat robot. Replaces catstream.py.
 
-Detection is triggered two ways:
-  1. /camera_check_trigger  — from seek_cat when LiDAR sees a cat-sized moving object
-  2. Every ALWAYS_ON_INTERVAL seconds — fallback for still/hidden cats
+- Live annotated camera feed (from /cat_detection/image when available,
+  falls back to raw GStreamer capture)
+- Find Eevee / Pichu / Raichu / Stop buttons
+- Shows current target and last seen cat
+- Publishes commands to /cat_target
 
-Publishes:
-  /cat_identity   (std_msgs/String)       — confirmed cat name
-  /cat_position   (geometry_msgs/PointStamped) — normalised [0,1] cx in frame
-  /cat_detection/image (sensor_msgs/Image) — annotated frame for web_stream
+Run:
+    export DISPLAY=:0
+    python3 web_stream.py
+Then open http://100.64.68.68:5000 on your phone.
 """
 
-import os
-import time
+import subprocess
 import threading
+import time
+import socket
+import os
 
 import cv2
 import numpy as np
-import torch
-import torchvision.transforms as T
-from PIL import Image as PILImage
-from torch import nn
-from torchvision import models
-from ultralytics import YOLO
+from flask import Flask, Response, request, jsonify
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import PointStamped
 from std_msgs.msg import String
+from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 # ── config ────────────────────────────────────────────────────────────────────
-YOLO_MODEL_PATH   = 'yolov8n.pt'
-MOBILENET_MODEL   = os.path.expanduser('~/cat_ws/models/cat_classifier.pth')
-CAT_CLASSES       = ['eevee', 'pichu', 'raichu']
-YOLO_CAT_CLASS_ID = 15          # COCO class id for 'cat'
-YOLO_CONF_THRESH  = 0.5
-MN_CONF_THRESH    = 0.70
-ALWAYS_ON_INTERVAL = 8.0        # seconds — run detection even without trigger
+PORT    = 5000
+W, H    = 1280, 720
+GST_PIPELINE = (
+    f'gst-launch-1.0 -q '
+    f'nvarguscamerasrc sensor-id=0 ! '
+    f'"video/x-raw(memory:NVMM),width={W},height={H},framerate=30/1" ! '
+    f'nvvidconv flip-method=2 ! '
+    f'"video/x-raw,format=BGRx" ! '
+    f'videoconvert ! '
+    f'"video/x-raw,format=BGR" ! '
+    f'fdsink fd=1'
+)
 # ─────────────────────────────────────────────────────────────────────────────
 
-TRANSFORM = T.Compose([
-    T.Resize((224, 224)),
-    T.ToTensor(),
-    T.Normalize([0.485, 0.456, 0.406],
-                [0.229, 0.224, 0.225])
-])
+app = Flask(__name__)
+
+# ── shared state ──────────────────────────────────────────────────────────────
+latest_frame   = None        # JPEG bytes
+frame_lock     = threading.Lock()
+ros_node       = None
+bridge         = CvBridge()
+current_target = 'none'
+last_seen_cat  = 'none'
+frame_count    = 0
+start_time     = time.time()
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-class CatDetector(Node):
+# ── camera capture (GStreamer subprocess fallback) ────────────────────────────
+
+def gst_capture_loop():
+    """
+    Captures raw BGR frames from GStreamer and stores as JPEG.
+    Used when /cat_detection/image is not available.
+    Only used if ROS annotated frames stop coming.
+    """
+    global latest_frame, frame_count
+    enc = [cv2.IMWRITE_JPEG_QUALITY, 80]
+    print('[camera] Starting GStreamer pipeline...')
+
+    while True:
+        try:
+            proc = subprocess.Popen(
+                GST_PIPELINE, shell=True,
+                stdout=subprocess.PIPE, bufsize=W * H * 3)
+            frame_size = W * H * 3
+
+            while True:
+                raw = proc.stdout.read(frame_size)
+                if len(raw) != frame_size:
+                    break
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((H, W, 3))
+                ok, jpg = cv2.imencode('.jpg', frame, enc)
+                if ok:
+                    with frame_lock:
+                        # Only update from GStreamer if ROS hasn't given us a frame recently
+                        latest_frame = jpg.tobytes()
+                    frame_count += 1
+
+            proc.kill()
+        except Exception as e:
+            print(f'[camera] Error: {e}')
+
+        print('[camera] Pipeline died, restarting in 2s...')
+        time.sleep(2)
+
+
+# ── ROS node ──────────────────────────────────────────────────────────────────
+
+class WebStreamNode(Node):
 
     def __init__(self):
-        super().__init__('cat_detector')
+        super().__init__('web_stream')
 
-        # ── models ────────────────────────────────────────────────────────────
-        self.get_logger().info('Loading YOLOv8...')
-        self.yolo = YOLO(YOLO_MODEL_PATH)
-        self.yolo.to('cpu')
+        self.cmd_pub = self.create_publisher(String, '/cat_target', 10)
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.classifier = self._load_classifier()
-
-        # ── state ─────────────────────────────────────────────────────────────
-        self.bridge       = CvBridge()
-        self.target_cat   = None          # 'eevee' | 'pichu' | 'raichu' | None
-        self.latest_frame = None          # most recent BGR frame
-        self.frame_lock   = threading.Lock()
-        self.triggered    = False         # flag set by trigger callback
-        self.last_run     = 0.0           # wall-clock time of last detection run
-        self.frame_count  = 0
-        self.detection_count = 0
-
-        # ── subscribers ───────────────────────────────────────────────────────
-        # Raw camera frames (always flowing)
+        # Subscribe to annotated frames from cat_detector
         self.create_subscription(
-            Image, '/camera/catrun', self.image_cb, 10)
+            Image, '/cat_detection/image', self.annotated_cb, 10)
 
-        # Target cat from web_stream UI or seek_cat
+        # Subscribe to identity updates to show on UI
         self.create_subscription(
-            String, '/cat_target', self.target_cb, 10)
+            String, '/cat_identity', self.identity_cb, 10)
 
-        # LiDAR motion trigger from seek_cat
-        self.create_subscription(
-            String, '/camera_check_trigger', self.trigger_cb, 10)
+        self.last_ros_frame = 0.0
+        self.get_logger().info('WebStreamNode ready.')
 
-        # ── publishers ────────────────────────────────────────────────────────
-        self.pub_position  = self.create_publisher(PointStamped, '/cat_position',        10)
-        self.pub_identity  = self.create_publisher(String,       '/cat_identity',         10)
-        self.pub_annotated = self.create_publisher(Image,        '/cat_detection/image',  10)
-
-        # ── timers ────────────────────────────────────────────────────────────
-        self.create_timer(0.1,  self.detection_loop)   # 10 Hz — checks if run needed
-        self.create_timer(3.0,  self.status_cb)        # periodic status log
-
-        self.get_logger().info('=' * 45)
-        self.get_logger().info('CatDetector ready!')
-        self.get_logger().info(f'  Classes : {CAT_CLASSES}')
-        self.get_logger().info(f'  Device  : {self.device}')
-        self.get_logger().info(f'  Trigger : /camera_check_trigger')
-        self.get_logger().info('=' * 45)
-
-    # ── model loader ──────────────────────────────────────────────────────────
-
-    def _load_classifier(self):
-        if not os.path.exists(MOBILENET_MODEL):
-            self.get_logger().warn(
-                f'cat_classifier.pth not found at {MOBILENET_MODEL}\n'
-                '  YOLO-only mode (no identity recognition).\n'
-                '  Run train_classifier.py to create the model.')
-            return None
-
-        self.get_logger().info(f'Loading MobileNetV2 from {MOBILENET_MODEL}')
-        m = models.mobilenet_v2(weights=None)
-        m.classifier[1] = nn.Linear(1280, len(CAT_CLASSES))
-        m.load_state_dict(torch.load(MOBILENET_MODEL, map_location=self.device))
-        m.to(self.device)
-        m.eval()
-        self.get_logger().info(f'MobileNetV2 ready! Classes: {CAT_CLASSES}')
-        return m
-
-    # ── callbacks ─────────────────────────────────────────────────────────────
-
-    def target_cb(self, msg: String):
-        text = msg.data.strip().lower()
-        for name in CAT_CLASSES:
-            if name in text:
-                self.target_cat = name
-                self.get_logger().info(f'Target cat: {self.target_cat}')
-                return
-        self.target_cat = None
-        self.get_logger().info('Target cleared.')
-
-    def trigger_cb(self, msg: String):
-        """Called by seek_cat when LiDAR sees a cat-sized moving object."""
-        self.get_logger().debug(
-            f'[trigger] Camera check requested for: {msg.data}')
-        self.triggered = True
-
-    def image_cb(self, msg: Image):
-        """Store latest frame — does NOT run detection here."""
-        self.frame_count += 1
-        if self.frame_count == 1:
-            self.get_logger().info(
-                f'Camera connected! {msg.width}x{msg.height}')
+    def annotated_cb(self, msg: Image):
+        global latest_frame, frame_count
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            with self.frame_lock:
-                self.latest_frame = frame
+            frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
+            _, buf = cv2.imencode(
+                '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            with frame_lock:
+                latest_frame = buf.tobytes()
+            frame_count += 1
+            self.last_ros_frame = time.time()
         except Exception as e:
-            self.get_logger().error(f'cv_bridge error: {e}')
+            self.get_logger().error(f'Frame error: {e}')
 
-    # ── detection loop ────────────────────────────────────────────────────────
+    def identity_cb(self, msg: String):
+        global last_seen_cat
+        last_seen_cat = msg.data.strip()
 
-    def detection_loop(self):
-        """
-        Runs at 10 Hz. Only executes YOLO when:
-          - triggered by LiDAR motion signal, OR
-          - ALWAYS_ON_INTERVAL seconds have passed (still cat fallback)
-        """
-        now = time.time()
-        should_run = (
-            self.triggered or
-            (now - self.last_run) >= ALWAYS_ON_INTERVAL
-        )
+    def send_command(self, cmd: str):
+        global current_target
+        current_target = cmd
+        self.cmd_pub.publish(String(data=cmd))
+        self.get_logger().info(f'Command: {cmd}')
 
-        if not should_run:
-            return
 
-        with self.frame_lock:
-            frame = self.latest_frame
+# ── ROS thread ────────────────────────────────────────────────────────────────
 
-        if frame is None:
-            return
+def ros_thread():
+    global ros_node
+    rclpy.init()
+    ros_node = WebStreamNode()
+    rclpy.spin(ros_node)
+    rclpy.shutdown()
 
-        self.triggered = False
-        self.last_run  = now
-        self._run_detection(frame)
 
-    # ── detection pipeline ────────────────────────────────────────────────────
+# ── MJPEG generator ───────────────────────────────────────────────────────────
 
-    def _run_detection(self, frame: np.ndarray):
-        h, w = frame.shape[:2]
-        annotated = frame.copy()
-        cat_found = False
-
-        try:
-            results = self.yolo(frame, verbose=False)
-        except Exception as e:
-            self.get_logger().error(f'YOLO error: {e}')
-            return
-
-        for result in results:
-            for box in result.boxes:
-                cls  = int(box.cls)
-                conf = float(box.conf)
-
-                if cls != YOLO_CAT_CLASS_ID or conf < YOLO_CONF_THRESH:
-                    continue
-
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                x1 = max(0, x1); y1 = max(0, y1)
-                x2 = min(w, x2); y2 = min(h, y2)
-
-                # Stage 2: identity classification
-                if self.classifier is not None:
-                    cat_name, id_conf = self._classify(frame[y1:y2, x1:x2])
-                else:
-                    cat_name, id_conf = 'cat', conf
-
-                # Filter by target if one is set
-                if self.target_cat and cat_name != self.target_cat:
-                    # Draw grey box for non-target cats
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (100, 100, 100), 2)
-                    cv2.putText(annotated, f'{cat_name} (not target)',
-                                (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (100, 100, 100), 1)
-                    continue
-
-                cat_found = True
-                self.detection_count += 1
-                cx_norm = float((x1 + x2) / 2) / w
-                cy_norm = float((y1 + y2) / 2) / h
-
-                self.get_logger().info(
-                    f'CAT FOUND: {cat_name} conf={id_conf:.2f} '
-                    f'cx={cx_norm:.2f} cy={cy_norm:.2f}')
-
-                # Publish identity
-                self.pub_identity.publish(String(data=cat_name))
-
-                # Publish normalised position
-                pt = PointStamped()
-                pt.header.stamp    = self.get_clock().now().to_msg()
-                pt.header.frame_id = 'camera'
-                pt.point.x = cx_norm
-                pt.point.y = cy_norm
-                pt.point.z = 0.0
-                self.pub_position.publish(pt)
-
-                # Annotate frame
-                color = (0, 255, 100)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                label = f'{cat_name} {id_conf:.2f}'
-                cv2.putText(annotated, label, (x1, y1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-        # Publish annotated frame for web_stream
-        try:
-            img_msg = self.bridge.cv2_to_imgmsg(annotated, 'bgr8')
-            img_msg.header.stamp = self.get_clock().now().to_msg()
-            self.pub_annotated.publish(img_msg)
-        except Exception as e:
-            self.get_logger().error(f'Annotated publish error: {e}')
-
-        if not cat_found:
-            self.get_logger().debug('No target cat in frame.')
-
-    # ── MobileNetV2 classifier ────────────────────────────────────────────────
-
-    def _classify(self, crop_bgr: np.ndarray):
-        if crop_bgr.size == 0:
-            return 'unknown', 0.0
-
-        pil = PILImage.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
-        t   = TRANSFORM(pil).unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            out   = self.classifier(t)
-            probs = torch.softmax(out, dim=1)[0]
-            idx   = int(probs.argmax())
-            conf  = float(probs[idx])
-
-        if conf < MN_CONF_THRESH:
-            return 'unknown', conf
-
-        return CAT_CLASSES[idx], conf
-
-    # ── status ────────────────────────────────────────────────────────────────
-
-    def status_cb(self):
-        if self.frame_count == 0:
-            self.get_logger().warn(
-                'No frames yet! Check: ros2 topic hz /camera/catrun')
+def generate_mjpeg():
+    while True:
+        with frame_lock:
+            frame = latest_frame
+        if frame:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n'
+                   + frame + b'\r\n')
         else:
-            self.get_logger().info(
-                f'frames={self.frame_count} | '
-                f'detections={self.detection_count} | '
-                f'target={self.target_cat or "any"} | '
-                f'classifier={"ON" if self.classifier else "OFF (YOLO only)"}')
+            time.sleep(0.02)
 
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = CatDetector()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+# ── Flask routes ──────────────────────────────────────────────────────────────
 
+@app.route('/video')
+def video():
+    return Response(generate_mjpeg(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route('/command', methods=['POST'])
+def command():
+    cmd = request.json.get('cmd', '').strip().lower()
+    if ros_node:
+        ros_node.send_command(cmd)
+        return jsonify({'status': 'ok', 'cmd': cmd})
+    return jsonify({'status': 'error', 'msg': 'ROS not ready'}), 500
+
+
+@app.route('/status')
+def status():
+    fps = frame_count / max(time.time() - start_time, 1)
+    return jsonify({
+        'target':    current_target,
+        'last_seen': last_seen_cat,
+        'fps':       round(fps, 1),
+        'frames':    frame_count,
+    })
+
+
+@app.route('/')
+def index():
+    return '''<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cat Robot</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap');
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      background:#0d0d0d; color:#eee;
+      font-family:'Space Mono', monospace;
+      display:flex; flex-direction:column;
+      align-items:center; padding:12px; gap:10px;
+      min-height:100vh;
+    }
+    h2 { color:#ff9f43; font-size:1.1rem; letter-spacing:0.1em; margin-top:6px; }
+    #feed {
+      width:100%; max-width:960px;
+      border-radius:8px; border:2px solid #222;
+      background:#111;
+    }
+    .status-bar {
+      display:flex; gap:12px; flex-wrap:wrap;
+      justify-content:center; font-size:0.7rem; color:#555;
+    }
+    .live { color:#2ecc71; }
+    .live::before {
+      content:''; display:inline-block;
+      width:7px; height:7px; border-radius:50%;
+      background:#2ecc71; margin-right:5px;
+      animation:blink 1.4s infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    .buttons {
+      display:grid; grid-template-columns:1fr 1fr;
+      gap:8px; width:100%; max-width:400px;
+    }
+    button {
+      padding:14px 10px; border:none; border-radius:8px;
+      font-family:inherit; font-size:0.9rem; font-weight:700;
+      cursor:pointer; transition:opacity 0.15s;
+    }
+    button:active { opacity:0.7; }
+    .btn-eevee  { background:#c8a96e; color:#1a1a1a; }
+    .btn-pichu  { background:#f7d02c; color:#1a1a1a; }
+    .btn-raichu { background:#e8631a; color:#fff; }
+    .btn-stop   { background:#e74c3c; color:#fff; grid-column:1/-1; }
+    #msg {
+      font-size:0.75rem; color:#2ecc71;
+      min-height:18px; text-align:center;
+    }
+  </style>
+</head>
+<body>
+  <h2>🐱 Cat Robot</h2>
+  <img id="feed" src="/video" alt="Live feed">
+  <div class="status-bar">
+    <span class="live">LIVE</span>
+    <span id="target-label">target: none</span>
+    <span id="seen-label">last seen: none</span>
+    <span id="fps-label">-- fps</span>
+  </div>
+  <div id="msg"></div>
+  <div class="buttons">
+    <button class="btn-eevee"  onclick="sendCmd('eevee')">🦊 Find Eevee</button>
+    <button class="btn-pichu"  onclick="sendCmd('pichu')">⚡ Find Pichu</button>
+    <button class="btn-raichu" onclick="sendCmd('raichu')">🔥 Find Raichu</button>
+    <button class="btn-stop"   onclick="sendCmd('stop')">⛔ Stop</button>
+  </div>
+  <script>
+    function sendCmd(cmd) {
+      document.getElementById('msg').innerText = 'Sending: ' + cmd + '...';
+      fetch('/command', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({cmd: cmd})
+      })
+      .then(r => r.json())
+      .then(d => {
+        document.getElementById('msg').innerText = '✅ ' + (d.cmd || d.msg);
+      })
+      .catch(() => {
+        document.getElementById('msg').innerText = '❌ Failed to send';
+      });
+    }
+
+    // Poll status every 2s
+    function pollStatus() {
+      fetch('/status')
+        .then(r => r.json())
+        .then(d => {
+          document.getElementById('target-label').innerText = 'target: ' + d.target;
+          document.getElementById('seen-label').innerText   = 'last seen: ' + d.last_seen;
+          document.getElementById('fps-label').innerText    = d.fps + ' fps';
+        })
+        .catch(() => {});
+    }
+    setInterval(pollStatus, 2000);
+    pollStatus();
+  </script>
+</body>
+</html>'''
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    main()
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        ip = '?.?.?.?'
+
+    # Start GStreamer capture (fallback when ROS annotated frames not available)
+    threading.Thread(target=gst_capture_loop, daemon=True).start()
+
+    # Start ROS
+    threading.Thread(target=ros_thread, daemon=True).start()
+
+    print(f'''
+┌─────────────────────────────────────┐
+│  🐱  Cat Robot Web UI               │
+├─────────────────────────────────────┤
+│  Local:     http://{ip}:{PORT}
+│  Tailscale: http://100.64.68.68:{PORT}
+│                                     │
+│  Buttons: Find Eevee/Pichu/Raichu   │
+│  Stop button halts the robot        │
+└─────────────────────────────────────┘
+''')
+
+    app.run(host='0.0.0.0', port=PORT, threaded=True)
