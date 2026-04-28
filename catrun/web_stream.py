@@ -37,7 +37,7 @@ W, H    = 1280, 720
 GST_PIPELINE = (
     f'gst-launch-1.0 -q '
     f'nvarguscamerasrc sensor-id=0 ! '
-    f'"video/x-raw(memory:NVMM),width={W},height={H},framerate=30/1" ! '
+    f'"video/x-raw(memory:NVMM),width={W},height={H},framerate=60/1" ! '
     f'nvvidconv flip-method=2 ! '
     f'"video/x-raw,format=BGRx" ! '
     f'videoconvert ! '
