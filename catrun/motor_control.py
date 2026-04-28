@@ -12,8 +12,8 @@ import math
 # Board pin numbers
 IN1 = 29
 IN2 = 31
-IN3 = 7    # moved from 32
-IN4 = 11    # moved from 33
+IN3 = 12    # moved from 32
+IN4 = 13    # moved from 33
 ENA = 32    # moved from 15 (hardware PWM)
 ENB = 33    # moved from 16 (hardware PWM)
 
@@ -35,8 +35,8 @@ class MotorControlNode(Node):
         # Setup pinmux
         os.system("sudo busybox devmem 0x2430068 w 0x5")   # pin 29 IN1
         os.system("sudo busybox devmem 0x2430070 w 0x5")   # pin 31 IN2
-        os.system("sudo busybox devmem 0x02430038 w 0x5") # pin 7  IN3
-        os.system("sudo busybox devmem 0x02430090 w 0x5") # pin 11 IN4
+        os.system("sudo busybox devmem 0x2448030 w 0xA")   # pin 12 IN3
+        os.system("sudo busybox devmem 0x243D028 w 0x1005")# pin 13 IN4
         os.system("sudo busybox devmem 0x2434080 w 0x5")   # pin 32 (ENA)
         os.system("sudo busybox devmem 0x2434040 w 0x5")   # pin 33 (ENB)
         time.sleep(0.5)
