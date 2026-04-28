@@ -212,6 +212,15 @@ def video():
         }
     )
 
+@app.route('/snapshot')
+def snapshot():
+    """Single JPEG frame — for polling fallback"""
+    with frame_lock:
+        frame = latest_frame
+    if frame:
+        return Response(frame, mimetype='image/jpeg',
+                       headers={'Cache-Control': 'no-cache'})
+    return '', 204
 
 @app.route('/command', methods=['POST'])
 def command():
@@ -298,9 +307,9 @@ def index():
 </head>
 <body>
   <h2>🐱 Cat Robot</h2>
-  <img id="feed" src="/video" alt="Live feed" 
-     onerror="this.src='/video?t='+Date.now()"
-     style="width:100%; max-width:960px; border-radius:8px; border:2px solid #222; background:#111; min-height:200px;">
+  <img id="feed" alt="Live feed"
+     style="width:100%; max-width:960px; border-radius:8px; 
+            border:2px solid #222; background:#111; min-height:240px;">
   <div class="status-bar">
     <span class="live">LIVE</span>
     <span id="target-label">target: none</span>
@@ -315,51 +324,72 @@ def index():
     <button class="btn-stop"   onclick="sendCmd('stop')">⛔ Stop</button>
   </div>
   <script>
-    // Auto-reconnect video if it stops
-    const feed = document.getElementById('feed');
-    feed.onerror = function() {
-        setTimeout(() => {
-            feed.src = '/video?t=' + Date.now();
-        }, 2000);
+  // Try MJPEG first, fall back to polling snapshots
+  const feed = document.getElementById('feed');
+  let usePolling = false;
+
+  function tryMjpeg() {
+    feed.src = '/video?' + Date.now();
+    feed.onload = () => { usePolling = false; };
+    feed.onerror = () => {
+      console.log('MJPEG failed, switching to polling');
+      usePolling = true;
+      pollSnapshot();
     };
+  }
 
-    // Keep stream alive on mobile (prevents sleep)
-    setInterval(() => {
-        if (feed.complete && feed.naturalHeight === 0) {
-            feed.src = '/video?t=' + Date.now();
-        }
-    }, 5000);
-
-    function sendCmd(cmd) {
-      document.getElementById('msg').innerText = 'Sending: ' + cmd + '...';
-      fetch('/command', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({cmd: cmd})
+  function pollSnapshot() {
+    if (!usePolling) return;
+    fetch('/snapshot?' + Date.now())
+      .then(r => r.blob())
+      .then(blob => {
+        const url = URL.createObjectURL(blob);
+        const old = feed.src;
+        feed.src = url;
+        if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+        setTimeout(pollSnapshot, 100); // 10fps polling
       })
+      .catch(() => setTimeout(pollSnapshot, 1000));
+  }
+
+  // Start with MJPEG, fallback to polling after 3s if no load
+  tryMjpeg();
+  setTimeout(() => {
+    if (feed.naturalHeight === 0) {
+      usePolling = true;
+      pollSnapshot();
+    }
+  }, 3000);
+
+  function sendCmd(cmd) {
+    document.getElementById('msg').innerText = 'Sending: ' + cmd + '...';
+    fetch('/command', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({cmd: cmd})
+    })
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('msg').innerText = '✅ ' + (d.cmd || d.msg);
+    })
+    .catch(() => {
+      document.getElementById('msg').innerText = '❌ Failed to send';
+    });
+  }
+
+  function pollStatus() {
+    fetch('/status')
       .then(r => r.json())
       .then(d => {
-        document.getElementById('msg').innerText = '✅ ' + (d.cmd || d.msg);
+        document.getElementById('target-label').innerText = 'target: ' + d.target;
+        document.getElementById('seen-label').innerText   = 'last seen: ' + d.last_seen;
+        document.getElementById('fps-label').innerText    = d.fps + ' fps';
       })
-      .catch(() => {
-        document.getElementById('msg').innerText = '❌ Failed to send';
-      });
-    }
-
-    // Poll status every 2s
-    function pollStatus() {
-      fetch('/status')
-        .then(r => r.json())
-        .then(d => {
-          document.getElementById('target-label').innerText = 'target: ' + d.target;
-          document.getElementById('seen-label').innerText   = 'last seen: ' + d.last_seen;
-          document.getElementById('fps-label').innerText    = d.fps + ' fps';
-        })
-        .catch(() => {});
-    }
-    setInterval(pollStatus, 2000);
-    pollStatus();
-  </script>
+      .catch(() => {});
+  }
+  setInterval(pollStatus, 2000);
+  pollStatus();
+</script>
 </body>
 </html>'''
 
