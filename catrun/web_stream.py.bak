@@ -109,24 +109,17 @@ class WebStreamNode(Node):
         self.cmd_pub = self.create_publisher(String, '/cat_target', 10)
 
         # Subscribe to annotated frames from cat_detector
-        # PRIMARY: annotated frames from cat_detector (PLAY mode)
         self.create_subscription(
             Image, '/cat_detection/image', self.annotated_cb, 10)
-
-        # FALLBACK: raw frames from camera_node (WATCH mode)
-        self.create_subscription(
-            Image, '/camera/catrun', self.raw_cb, 10)
 
         # Subscribe to identity updates to show on UI
         self.create_subscription(
             String, '/cat_identity', self.identity_cb, 10)
 
-        self.last_annotated_time = 0.0
-        self.ANNOTATED_TIMEOUT = 2.0  # seconds
+        self.last_ros_frame = 0.0
         self.get_logger().info('WebStreamNode ready.')
 
     def annotated_cb(self, msg: Image):
-        """Annotated frames from cat_detector — PLAY mode"""
         global latest_frame, frame_count
         try:
             frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -135,24 +128,9 @@ class WebStreamNode(Node):
             with frame_lock:
                 latest_frame = buf.tobytes()
             frame_count += 1
-            self.last_annotated_time = time.time()
+            self.last_ros_frame = time.time()
         except Exception as e:
-            self.get_logger().error(f'Annotated frame error: {e}')
-
-    def raw_cb(self, msg: Image):
-        """Raw frames from camera_node — WATCH mode fallback"""
-        global latest_frame, frame_count
-        # Only use raw if annotated frames stopped coming
-        if time.time() - self.last_annotated_time < self.ANNOTATED_TIMEOUT:
-            return
-        try:
-            frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
-            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            with frame_lock:
-                latest_frame = buf.tobytes()
-            frame_count += 1
-        except Exception as e:
-            self.get_logger().error(f'Raw frame error: {e}')
+            self.get_logger().error(f'Frame error: {e}')
 
     def identity_cb(self, msg: String):
         global last_seen_cat
@@ -331,6 +309,9 @@ if __name__ == '__main__':
         ip = socket.gethostbyname(socket.gethostname())
     except Exception:
         ip = '?.?.?.?'
+
+    # Start GStreamer capture (fallback when ROS annotated frames not available)
+    threading.Thread(target=gst_capture_loop, daemon=True).start()
 
     # Start ROS
     threading.Thread(target=ros_thread, daemon=True).start()
