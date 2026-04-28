@@ -131,7 +131,7 @@ class WebStreamNode(Node):
         try:
             frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
             _, buf = cv2.imencode(
-                '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50]) # Was 80
             with frame_lock:
                 latest_frame = buf.tobytes()
             frame_count += 1
@@ -147,7 +147,7 @@ class WebStreamNode(Node):
             return
         try:
             frame = bridge.imgmsg_to_cv2(msg, 'bgr8')
-            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50]) # was 80
             with frame_lock:
                 latest_frame = buf.tobytes()
             frame_count += 1
@@ -179,6 +179,12 @@ def ros_thread():
 
 def generate_mjpeg():
     while True:
+        # New
+        now = time.time()
+        # ✅ Cap at 10fps for web stream — reduces bandwidth
+        if now - last_sent < 0.1:
+            time.sleep(0.02)
+            continue
         with frame_lock:
             frame = latest_frame
         if frame:
@@ -201,7 +207,14 @@ def video():
 def command():
     cmd = request.json.get('cmd', '').strip().lower()
     if ros_node:
-        ros_node.send_command(cmd)
+         # New
+         # ✅ Run in thread so Flask doesn't block
+        threading.Thread(
+            target=ros_node.send_command, 
+            args=(cmd,), 
+            daemon=True
+        ).start()
+        # was: ros_node.send_command(cmd)
         return jsonify({'status': 'ok', 'cmd': cmd})
     return jsonify({'status': 'error', 'msg': 'ROS not ready'}), 500
 

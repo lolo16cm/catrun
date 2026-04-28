@@ -40,7 +40,7 @@ CAT_CLASSES       = ['eevee', 'pichu', 'raichu']
 YOLO_CAT_CLASS_ID = 15          # COCO class id for 'cat'
 YOLO_CONF_THRESH  = 0.5
 MN_CONF_THRESH    = 0.70
-ALWAYS_ON_INTERVAL = 8.0        # seconds — run detection even without trigger
+ALWAYS_ON_INTERVAL = 0.1        # NEW - run every frame - was ALWAYS_ON_INTERVAL = 8.0 - Too slow
 # ─────────────────────────────────────────────────────────────────────────────
 
 TRANSFORM = T.Compose([
@@ -93,7 +93,7 @@ class CatDetector(Node):
         self.pub_annotated = self.create_publisher(Image,        '/cat_detection/image',  10)
 
         # ── timers ────────────────────────────────────────────────────────────
-        self.create_timer(0.1,  self.detection_loop)   # 10 Hz — checks if run needed
+        self.create_timer(0.05,  self.detection_loop)   # NEW - faster detection loop - was 0.01 - 10 Hz — checks if run needed
         self.create_timer(3.0,  self.status_cb)        # periodic status log
 
         self.get_logger().info('=' * 45)
@@ -188,7 +188,7 @@ class CatDetector(Node):
         cat_found = False
 
         try:
-            results = self.yolo(frame, verbose=False)
+            results = self.yolo(frame, verbose=False, stream=True, imgsz=320) # Added stream=True, imgsz=320
         except Exception as e:
             self.get_logger().error(f'YOLO error: {e}')
             return

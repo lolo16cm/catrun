@@ -14,7 +14,7 @@ class CameraNode(Node):
 
         pipeline = (
             'nvarguscamerasrc sensor-id=0 ! '
-            'video/x-raw(memory:NVMM), width=1920, height=1080, framerate=60/1 ! '
+            'video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! ' # Was width=1920, height=1080, framerate=60/1
             'nvvidconv flip-method=2 ! '
             'video/x-raw, format=BGRx ! '
             'videoconvert ! '
@@ -30,7 +30,7 @@ class CameraNode(Node):
             return
 
         self.get_logger().info('✅ Camera opened! Publishing to /camera/catrun')
-        self.create_timer(1.0/30.0, self.timer_callback)
+        self.create_timer(1.0/15.0, self.timer_callback) # was self.create_timer(1.0/30.0, self.timer_callback)
 
     def timer_callback(self):
         ret, frame = self.cap.read()
