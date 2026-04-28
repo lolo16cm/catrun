@@ -324,42 +324,26 @@ def index():
     <button class="btn-stop"   onclick="sendCmd('stop')">⛔ Stop</button>
   </div>
   <script>
-  // Try MJPEG first, fall back to polling snapshots
   const feed = document.getElementById('feed');
-  let usePolling = false;
 
-  function tryMjpeg() {
-    feed.src = '/video?' + Date.now();
-    feed.onload = () => { usePolling = false; };
-    feed.onerror = () => {
-      console.log('MJPEG failed, switching to polling');
-      usePolling = true;
-      pollSnapshot();
-    };
-  }
-
+  // Always use polling — most reliable on mobile
   function pollSnapshot() {
-    if (!usePolling) return;
     fetch('/snapshot?' + Date.now())
-      .then(r => r.blob())
+      .then(r => {
+        if (!r.ok) throw new Error('no frame');
+        return r.blob();
+      })
       .then(blob => {
         const url = URL.createObjectURL(blob);
         const old = feed.src;
         feed.src = url;
-        if (old.startsWith('blob:')) URL.revokeObjectURL(old);
-        setTimeout(pollSnapshot, 100); // 10fps polling
+        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
       })
-      .catch(() => setTimeout(pollSnapshot, 1000));
+      .catch(() => {})
+      .finally(() => setTimeout(pollSnapshot, 80)); // ~12fps
   }
 
-  // Start with MJPEG, fallback to polling after 3s if no load
-  tryMjpeg();
-  setTimeout(() => {
-    if (feed.naturalHeight === 0) {
-      usePolling = true;
-      pollSnapshot();
-    }
-  }, 3000);
+  pollSnapshot();
 
   function sendCmd(cmd) {
     document.getElementById('msg').innerText = 'Sending: ' + cmd + '...';
