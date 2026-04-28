@@ -9,19 +9,22 @@ import os
 import time
 import math
 
-# Board pin numbers
+# ── Pin assignments (BOARD numbering) ─────────────────────────────────────────
 IN1 = 29
 IN2 = 31
-IN3 = 32    # moved from 32
-IN4 = 33    # moved from 33
-# ENA = 32    # moved from 15 (hardware PWM)
-# ENB = 33    # moved from 16 (hardware PWM)
+IN3 = 32
+IN4 = 33
+ENA = 15    # PWM speed control — left motors
+ENB = 16    # PWM speed control — right motors
 
-SAFE_DISTANCE = 0.05
-SLOW_DISTANCE = 0.08
-PWM_FREQ      = 1000   # Hz
+# ── Safety distances (metres) ─────────────────────────────────────────────────
+SAFE_DISTANCE = 0.05   # stop and recover
+SLOW_DISTANCE = 0.08   # slow down
 
-# Speed levels (0-100)
+# ── PWM ───────────────────────────────────────────────────────────────────────
+PWM_FREQ  = 1000   # Hz
+
+# ── Speed levels (0-100 duty cycle) ──────────────────────────────────────────
 FULL_SPEED = 100
 SLOW_SPEED = 50
 TURN_SPEED = 70
@@ -32,16 +35,16 @@ class MotorControlNode(Node):
     def __init__(self):
         super().__init__('motor_control')
 
-        # Setup pinmux
+        # ── pinmux setup ──────────────────────────────────────────────────────
         os.system("sudo busybox devmem 0x2430068 w 0x5")   # pin 29 IN1
         os.system("sudo busybox devmem 0x2430070 w 0x5")   # pin 31 IN2
-        # os.system("sudo busybox devmem 0x2448030 w 0xA")   # pin 12 IN3
-        # os.system("sudo busybox devmem 0x243D028 w 0x1005")# pin 13 IN4
-        os.system("sudo busybox devmem 0x2434080 w 0x5")   # pin 32 (ENA)
-        os.system("sudo busybox devmem 0x2434040 w 0x5")   # pin 33 (ENB)
+        os.system("sudo busybox devmem 0x2434080 w 0x5")   # pin 32 IN3
+        os.system("sudo busybox devmem 0x2434040 w 0x5")   # pin 33 IN4
+        os.system("sudo busybox devmem 0x2430040 w 0x5")   # pin 15 ENA
+        os.system("sudo busybox devmem 0x2430048 w 0x5")   # pin 16 ENB
         time.sleep(0.5)
 
-        # Setup GPIO
+        # ── GPIO setup ────────────────────────────────────────────────────────
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(IN1, GPIO.OUT)
         GPIO.setup(IN2, GPIO.OUT)
@@ -50,31 +53,35 @@ class MotorControlNode(Node):
         GPIO.setup(ENA, GPIO.OUT)
         GPIO.setup(ENB, GPIO.OUT)
 
-        # Setup PWM
+        # ── PWM setup ─────────────────────────────────────────────────────────
         self.pwm_a = GPIO.PWM(ENA, PWM_FREQ)
         self.pwm_b = GPIO.PWM(ENB, PWM_FREQ)
         self.pwm_a.start(0)
         self.pwm_b.start(0)
 
+        # ── state ─────────────────────────────────────────────────────────────
         self.front_distance = float('inf')
         self.left_distance  = float('inf')
         self.right_distance = float('inf')
         self.is_recovering  = False
         self.last_angular   = 0.0
 
+        # ── subscriptions ─────────────────────────────────────────────────────
         self.create_subscription(Twist,     '/cmd_vel', self.cmd_vel_callback, 10)
         self.create_subscription(LaserScan, '/scan',    self.scan_callback,    10)
 
         self.get_logger().info('Motor Control Node started with PWM speed control!')
+        self.get_logger().info(f'Pins — IN1:{IN1} IN2:{IN2} IN3:{IN3} IN4:{IN4} ENA:{ENA} ENB:{ENB}')
 
     # ── speed control ─────────────────────────────────────────────────────────
 
     def set_speed(self, speed):
         """Set speed for both motors (0-100)."""
+        speed = max(0, min(100, speed))
         self.pwm_a.ChangeDutyCycle(speed)
         self.pwm_b.ChangeDutyCycle(speed)
 
-    # ── LiDAR ─────────────────────────────────────────────────────────────────
+    # ── LiDAR scan ────────────────────────────────────────────────────────────
 
     def safe_min(self, indices, ranges):
         vals = [ranges[i] for i in indices
@@ -86,9 +93,9 @@ class MotorControlNode(Node):
     def scan_callback(self, msg):
         ranges = msg.ranges
         n = len(ranges)
-        front_idx = list(range(0, n//12)) + list(range(11*n//12, n))
-        left_idx  = list(range(n//6, n//3))
-        right_idx = list(range(2*n//3, 5*n//6))
+        front_idx = list(range(0, n // 12)) + list(range(11 * n // 12, n))
+        left_idx  = list(range(n // 6, n // 3))
+        right_idx = list(range(2 * n // 3, 5 * n // 6))
         self.front_distance = self.safe_min(front_idx, ranges)
         self.left_distance  = self.safe_min(left_idx,  ranges)
         self.right_distance = self.safe_min(right_idx, ranges)
@@ -159,6 +166,7 @@ class MotorControlNode(Node):
         angular = msg.angular.z
         self.last_angular = angular
 
+        # Hard stop — obstacle too close while moving forward
         if linear > 0.1 and self.front_distance < SAFE_DISTANCE:
             self.recover_from_obstacle()
             return
@@ -166,3 +174,44 @@ class MotorControlNode(Node):
         if linear > 0.1:
             # Slow down when obstacle is close
             if self.front_distance < SLOW_DISTANCE:
+                self.forward(speed=SLOW_SPEED)
+            else:
+                self.forward(speed=FULL_SPEED)
+
+        elif linear < -0.1:
+            self.backward(speed=SLOW_SPEED)
+
+        elif angular > 0.1:
+            self.turn_left()
+
+        elif angular < -0.1:
+            self.turn_right()
+
+        else:
+            self.stop()
+
+    # ── cleanup ───────────────────────────────────────────────────────────────
+
+    def destroy_node(self):
+        self.stop()
+        self.pwm_a.stop()
+        self.pwm_b.stop()
+        GPIO.cleanup()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MotorControlNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
