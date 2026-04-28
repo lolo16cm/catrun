@@ -199,8 +199,18 @@ def generate_mjpeg():
 
 @app.route('/video')
 def video():
-    return Response(generate_mjpeg(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    # return Response(generate_mjpeg(),
+    #                mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(
+        generate_mjpeg(),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+        headers={
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'Access-Control-Allow-Origin': '*',
+        }
+    )
 
 
 @app.route('/command', methods=['POST'])
@@ -288,7 +298,9 @@ def index():
 </head>
 <body>
   <h2>🐱 Cat Robot</h2>
-  <img id="feed" src="/video" alt="Live feed">
+  <img id="feed" src="/video" alt="Live feed" 
+     onerror="this.src='/video?t='+Date.now()"
+     style="width:100%; max-width:960px; border-radius:8px; border:2px solid #222; background:#111; min-height:200px;">
   <div class="status-bar">
     <span class="live">LIVE</span>
     <span id="target-label">target: none</span>
@@ -303,6 +315,21 @@ def index():
     <button class="btn-stop"   onclick="sendCmd('stop')">⛔ Stop</button>
   </div>
   <script>
+    // Auto-reconnect video if it stops
+    const feed = document.getElementById('feed');
+    feed.onerror = function() {
+        setTimeout(() => {
+            feed.src = '/video?t=' + Date.now();
+        }, 2000);
+    };
+
+    // Keep stream alive on mobile (prevents sleep)
+    setInterval(() => {
+        if (feed.complete && feed.naturalHeight === 0) {
+            feed.src = '/video?t=' + Date.now();
+        }
+    }, 5000);
+
     function sendCmd(cmd) {
       document.getElementById('msg').innerText = 'Sending: ' + cmd + '...';
       fetch('/command', {
