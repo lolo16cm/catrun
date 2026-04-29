@@ -19,6 +19,7 @@ def generate_launch_description():
             name='tf_base_link_laser',
             arguments=['0', '0', '0.19', '3.14159', '0', '0',
                        'base_link', 'laser'],
+            parameters=[{'publish_period_ms': 500}],  # publish every 500ms not 100ms
         ),
 
         # Terminal 3 — TF base_link → base_footprint
@@ -28,6 +29,7 @@ def generate_launch_description():
             name='tf_base_link_footprint',
             arguments=['0', '0', '0', '0', '0', '0',
                        'base_link', 'base_footprint'],
+            parameters=[{'publish_period_ms': 500}],  # publish every 500ms not 100ms
         ),
 
         # Terminal 4 — rf2o odometry
