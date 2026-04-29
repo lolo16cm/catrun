@@ -30,7 +30,7 @@ setup(
             'motor_control = catrun.motor_control:main',
             'navigation = catrun.navigation:main',
             'flee_behavior = catrun.flee_behavior:main',
-
+            'set_pose = catrun.set_pose:main',
             'camera_node = catrun.camera_node:main',
             'web_stream = catrun.web_stream:main',
             'cat_detector = catrun.cat_detector:main',

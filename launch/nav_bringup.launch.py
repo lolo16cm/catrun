@@ -56,5 +56,17 @@ def generate_launch_description():
                 ),
             ]
         ),
-
+        
+        # Add inside LaunchDescription, after Nav2 TimerAction
+        TimerAction(
+            period=10.0,  # Wait 10s for Nav2 + AMCL to fully start
+            actions=[
+                Node(
+                    package='catrun',
+                    executable='set_pose',
+                    name='set_initial_pose',
+                    output='screen',
+                ),
+            ]
+        ),
     ])
