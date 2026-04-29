@@ -9,7 +9,7 @@ import time
 # ── Set your robot's starting position here ──────────────
 INITIAL_X   =  0.0   # x coordinate on map
 INITIAL_Y   =  0.0   # y coordinate on map
-INITIAL_YAW =  0.0   # degrees — 0 = facing right, 90 = facing up
+INITIAL_YAW =  90.0   # degrees — 0 = facing right, 90 = facing up
 # ─────────────────────────────────────────────────────────
 
 class SetPoseNode(Node):
