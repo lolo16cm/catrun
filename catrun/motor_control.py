@@ -10,10 +10,10 @@ import time
 import math
 
 # Board pin numbers
-IN1 = 29
-IN2 = 31
-IN3 = 32
-IN4 = 33
+IN1 = 32  # was 29
+IN2 = 33  # was 31
+IN3 = 29  # was 32
+IN4 = 31  # was 33
 
 SAFE_DISTANCE = 0.05
 SLOW_DISTANCE = 0.08
