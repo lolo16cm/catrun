@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
 seek_cat.py
-1. Seek target cat by navigating waypoints
-2. When found, follow at ~1 foot (0.3m) distance
-3. Stop following when target changes or stop command received
+Navigates the robot toward a target cat (Eevee, Raichu, or Pichu).
+
+Detection pipeline:
+  1. LiDAR scan diff → detect moving clusters of cat-size
+  2. If moving cluster found → trigger YOLOv8 camera check
+  3. If no motion for IDLE_SCAN_INTERVAL → periodic camera sweep
+  4. If cat confirmed → steer toward it
+  5. If cat lost for LOST_TIMEOUT → spin + visit waypoints
 """
 
 import math
@@ -19,27 +24,26 @@ from std_msgs.msg import String
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 
-LINEAR_SPEED    = 0.15   # m/s forward
-ANGULAR_SPEED   = 0.4    # rad/s turning
-CENTER_THRESH   = 0.12   # normalised horizontal error before moving forward
-LOST_TIMEOUT    = 5.0    # s — declare cat lost after this
-SPIN_DURATION   = 4.0    # s — spin at each waypoint before moving on
-
-# Follow distance
-FOLLOW_DIST_TARGET = 0.30   # m — 1 foot, ideal follow distance
-FOLLOW_DIST_MIN    = 0.20   # m — too close, back up
-FOLLOW_DIST_MAX    = 0.50   # m — too far, speed up
-FOLLOW_SPEED_MAX   = 0.20   # m/s max follow speed
+LINEAR_SPEED  = 0.15   # m/s forward
+ANGULAR_SPEED = 0.4    # rad/s turning
+CENTER_THRESH = 0.15   # normalised horizontal error before moving forward
+LOST_TIMEOUT  = 5.0    # s — declare cat lost after this
+SPIN_DURATION = 4.0    # s — spin at each waypoint before moving on
 
 # LiDAR motion detection
-MOTION_DIST_THRESH  = 0.15
-CLUSTER_MIN_POINTS  = 3
-CAT_SIZE_MIN        = 0.10
-CAT_SIZE_MAX        = 0.60
-CAT_DIST_MAX        = 3.0
-IDLE_SCAN_INTERVAL  = 8.0
+MOTION_DIST_THRESH  = 0.15   # m — point must move this much between scans
+CLUSTER_MIN_POINTS  = 3      # minimum lidar points in a cluster
+CAT_SIZE_MIN        = 0.10   # m — min cluster width
+CAT_SIZE_MAX        = 0.60   # m — max cluster width
+CAT_DIST_MAX        = 3.0    # m — only care about clusters within this range
 
+# Fallback periodic camera sweep (when no LiDAR motion)
+IDLE_SCAN_INTERVAL  = 8.0    # s — run camera check even if nothing is moving
+
+# Known cats — add or rename as needed
 KNOWN_CATS = {'eevee', 'raichu', 'pichu'}
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 WAYPOINTS = [
     ('L1',  0.726,  0.831),
@@ -48,20 +52,27 @@ WAYPOINTS = [
     ('L4',  0.0,    0.0),
 ]
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+
+# ── small helpers ─────────────────────────────────────────────────────────────
 
 def polar_to_xy(r, angle_rad):
     return r * math.cos(angle_rad), r * math.sin(angle_rad)
 
+
 def cluster_width(points):
+    """Rough bounding-box width of a list of (x,y) points."""
     if not points:
         return 0.0
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
-    return math.sqrt((max(xs)-min(xs))**2 + (max(ys)-min(ys))**2)
+    dx = max(xs) - min(xs)
+    dy = max(ys) - min(ys)
+    return math.sqrt(dx**2 + dy**2)
+
 
 def euclidean(p1, p2):
     return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+
 
 # ── node ──────────────────────────────────────────────────────────────────────
 
@@ -70,13 +81,11 @@ class SeekCat(Node):
     def __init__(self):
         super().__init__('seek_cat')
 
-        # State
-        self.target_cat     = None
-        self.last_seen      = None
-        self.cat_cx         = None   # normalised [0,1] horizontal pos
-        self.cat_dist       = None   # estimated distance to cat from LiDAR
+        # ── state ─────────────────────────────────────────────────────────────
+        self.target_cat     = None   # 'eevee' | 'raichu' | 'pichu' | None
+        self.last_seen      = None   # rclpy.Time when cat was last confirmed
+        self.cat_cx         = None   # normalised [0,1] horizontal pos in frame
         self.active         = False
-        self.following      = False  # True when cat found and following
 
         # Waypoint search state
         self.searching      = False
@@ -85,23 +94,21 @@ class SeekCat(Node):
         self.nav_sent       = False
 
         # LiDAR
-        self.prev_scan          = None
-        self.last_camera_check  = 0.0
-        self.front_distance     = float('inf')  # closest obstacle ahead
+        self.prev_scan      = None   # previous LaserScan ranges for diff
+        self.last_camera_check = 0.0  # wall-clock time of last camera trigger
 
         # Nav2
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # Subscriptions
+        # ── subscriptions ─────────────────────────────────────────────────────
         self.create_subscription(String,       '/cat_target',   self.target_cb,   10)
         self.create_subscription(String,       '/cat_identity', self.identity_cb, 10)
         self.create_subscription(PointStamped, '/cat_position', self.position_cb, 10)
         self.create_subscription(LaserScan,    '/scan',         self.scan_cb,     10)
 
-        # Publishers
+        # ── publishers ────────────────────────────────────────────────────────
         self.cmd_pub            = self.create_publisher(Twist,  '/cmd_vel',              10)
         self.camera_trigger_pub = self.create_publisher(String, '/camera_check_trigger', 10)
-        self.status_pub         = self.create_publisher(String, '/seek_status',          10)
 
         # Control loop 10 Hz
         self.create_timer(0.1, self.control_loop)
@@ -119,58 +126,50 @@ class SeekCat(Node):
             self.target_cat = None
             self.active     = False
             self.searching  = False
-            self.following  = False
             self.stop_robot()
             self.get_logger().info('Seek stopped.')
-            self._publish_status('stopped')
             return
 
         if text not in KNOWN_CATS:
-            self.get_logger().warn(f'Unknown cat "{text}". Known: {KNOWN_CATS}')
+            self.get_logger().warn(
+                f'Unknown cat "{text}". Known: {KNOWN_CATS}')
             return
 
         self.target_cat     = text
         self.active         = True
         self.searching      = False
-        self.following      = False
         self.waypoint_index = 0
         self.nav_sent       = False
         self.last_seen      = None
         self.cat_cx         = None
-        self.cat_dist       = None
         self.get_logger().info(f'Seeking: {self.target_cat}')
-        self._publish_status(f'seeking {self.target_cat}')
 
     def identity_cb(self, msg: String):
+        """
+        Receives confirmed cat identity from the vision pipeline.
+        Expected format: 'eevee' | 'raichu' | 'pichu'
+        """
         if self.target_cat and msg.data.strip().lower() == self.target_cat:
             self.last_seen = self.get_clock().now()
             if self.searching:
                 self.get_logger().info(
-                    f'Found {self.target_cat}! Switching to follow.')
+                    f'Found {self.target_cat}! Switching to chase.')
                 self.searching  = False
-                self.following  = True
                 self.nav_sent   = False
                 self.spin_start = None
                 self.stop_robot()
-                self._publish_status(f'following {self.target_cat}')
 
     def position_cb(self, msg: PointStamped):
+        """Normalised [0,1] x position of cat in camera frame."""
         self.cat_cx    = msg.point.x
         self.last_seen = self.get_clock().now()
-        if not self.following:
-            self.following = True
-            self._publish_status(f'following {self.target_cat}')
 
     def scan_cb(self, scan: LaserScan):
-        # Update front distance for safe following
-        ranges = scan.ranges
-        n = len(ranges)
-        front_idx = list(range(0, n//12)) + list(range(11*n//12, n))
-        front_vals = [ranges[i] for i in front_idx
-                      if scan.range_min < ranges[i] < scan.range_max
-                      and not math.isinf(ranges[i])]
-        self.front_distance = min(front_vals) if front_vals else float('inf')
-
+        """
+        LiDAR callback.
+        Diffs current scan against previous to find moving clusters.
+        If a cat-sized moving cluster is found within range → trigger camera.
+        """
         if not self.active:
             self.prev_scan = scan
             return
@@ -179,16 +178,21 @@ class SeekCat(Node):
             self.prev_scan = scan
             return
 
-        # Motion detection for camera trigger
+        # ── compute moving points ─────────────────────────────────────────────
         moving_pts = []
         n = min(len(scan.ranges), len(self.prev_scan.ranges))
+
         for i in range(n):
             r_now  = scan.ranges[i]
             r_prev = self.prev_scan.ranges[i]
+
+            # Skip invalid readings
             if not (scan.range_min < r_now  < min(scan.range_max, CAT_DIST_MAX)):
                 continue
             if not (scan.range_min < r_prev < min(scan.range_max, CAT_DIST_MAX)):
                 continue
+
+            # If range changed significantly → something moved
             if abs(r_now - r_prev) > MOTION_DIST_THRESH:
                 angle = scan.angle_min + i * scan.angle_increment
                 x, y  = polar_to_xy(r_now, angle)
@@ -197,29 +201,35 @@ class SeekCat(Node):
         self.prev_scan = scan
 
         if not moving_pts:
-            return
+            return  # nothing moving
 
+        # ── cluster moving points ─────────────────────────────────────────────
         clusters = self._cluster_points(moving_pts, gap=0.3)
+
         for cluster in clusters:
             if len(cluster) < CLUSTER_MIN_POINTS:
                 continue
+
             width = cluster_width(cluster)
             if CAT_SIZE_MIN <= width <= CAT_SIZE_MAX:
-                # Estimate distance to cluster center
-                xs = [p[0] for p in cluster]
-                ys = [p[1] for p in cluster]
-                cx = sum(xs) / len(xs)
-                cy = sum(ys) / len(ys)
-                self.cat_dist = math.sqrt(cx**2 + cy**2)
+                self.get_logger().info(
+                    f'[LiDAR] Cat-sized moving cluster: '
+                    f'{len(cluster)} pts, width={width:.2f}m → triggering camera'
+                )
                 self._trigger_camera()
-                return
+                return  # one trigger per scan cycle is enough
 
     # ── camera trigger ────────────────────────────────────────────────────────
 
     def _trigger_camera(self):
+        """
+        Publish a trigger so the vision node runs YOLOv8 and publishes
+        the identity to /cat_identity.
+        Rate-limited to avoid spamming.
+        """
         now = time.time()
         if now - self.last_camera_check < 0.5:
-            return
+            return  # max 2 triggers/sec
         self.last_camera_check = now
         msg = String()
         msg.data = self.target_cat or 'any'
@@ -231,84 +241,39 @@ class SeekCat(Node):
         if not self.active or self.target_cat is None:
             return
 
-        # Periodic camera sweep
+        # ── periodic camera sweep even when nothing is moving ─────────────────
         now = time.time()
         if now - self.last_camera_check > IDLE_SCAN_INTERVAL:
+            self.get_logger().debug('[Idle sweep] Triggering periodic camera check')
             self._trigger_camera()
 
-        # Check if cat seen recently
+        # ── cat visible recently → chase ──────────────────────────────────────
         if self.last_seen is not None:
             elapsed = (self.get_clock().now() - self.last_seen).nanoseconds / 1e9
-
             if elapsed < LOST_TIMEOUT:
-                # Cat visible — follow it
                 self.searching = False
-                self.following = True
-                self.follow_cat()
+                self.steer_toward_cat()
                 return
-            else:
-                # Cat lost
-                if self.following:
-                    self.get_logger().info(
-                        f'{self.target_cat} lost! Switching to search.')
-                    self.following      = False
-                    self.searching      = True
-                    self.nav_sent       = False
-                    self.waypoint_index = 0
-                    self._publish_status(f'searching {self.target_cat}')
 
-        # Search mode
+        # ── cat lost → search ─────────────────────────────────────────────────
         self.searching = True
         self.waypoint_search()
 
-    # ── follow behavior ───────────────────────────────────────────────────────
+    # ── steering ──────────────────────────────────────────────────────────────
 
-    def follow_cat(self):
-        """
-        Follow cat at ~1 foot (0.3m) distance.
-        Uses camera cx for angular steering.
-        Uses LiDAR front distance for linear speed control.
-        """
+    def steer_toward_cat(self):
         if self.cat_cx is None:
             return
 
         twist = Twist()
-        error = self.cat_cx - 0.5  # negative=left, positive=right
+        error = self.cat_cx - 0.5   # negative=left, positive=right
 
-        # Angular — steer toward cat center
-        twist.angular.z = -ANGULAR_SPEED * (error / 0.5)
-
-        # Linear — maintain 1 foot distance
-        dist = self.cat_dist if self.cat_dist is not None else self.front_distance
-
-        if dist < FOLLOW_DIST_MIN:
-            # Too close — back up
-            twist.linear.x = -0.10
-            self.get_logger().info(
-                f'Too close ({dist:.2f}m) — backing up', 
-                throttle_duration_sec=1.0)
-
-        elif dist > FOLLOW_DIST_MAX:
-            # Too far — move forward faster
-            speed = min(FOLLOW_SPEED_MAX,
-                       FOLLOW_SPEED_MAX * (dist - FOLLOW_DIST_TARGET) / 0.3)
-            # Only move forward if cat is centered
-            if abs(error) < CENTER_THRESH:
-                twist.linear.x = speed
-            self.get_logger().info(
-                f'Following ({dist:.2f}m) speed={speed:.2f}',
-                throttle_duration_sec=1.0)
-
-        elif FOLLOW_DIST_MIN <= dist <= FOLLOW_DIST_TARGET:
-            # In sweet spot — slow approach
-            twist.linear.x = 0.05 if abs(error) < CENTER_THRESH else 0.0
-            self.get_logger().info(
-                f'At follow distance ({dist:.2f}m) ✅',
-                throttle_duration_sec=1.0)
-
+        if abs(error) > CENTER_THRESH:
+            twist.angular.z = -ANGULAR_SPEED * (error / 0.5)
+            twist.linear.x  = 0.05
         else:
-            # Good distance — maintain position
-            twist.linear.x = 0.0
+            twist.linear.x  = LINEAR_SPEED
+            twist.angular.z = -ANGULAR_SPEED * (error / 0.5) * 0.3
 
         self.cmd_pub.publish(twist)
 
@@ -325,6 +290,7 @@ class SeekCat(Node):
             self.spin_start = None
             return
 
+        # Arrived — spin and look
         if self.spin_start is None:
             self.spin_start = self.get_clock().now()
             self.get_logger().info(f'[Search] Arrived at {label}, spinning...')
@@ -335,9 +301,11 @@ class SeekCat(Node):
             twist = Twist()
             twist.angular.z = ANGULAR_SPEED
             self.cmd_pub.publish(twist)
+            # Also trigger camera while spinning
             self._trigger_camera()
             return
 
+        # Spin done, not found → next waypoint
         self.get_logger().info(
             f'[Search] {self.target_cat} not at {label}, trying next waypoint...')
         self.waypoint_index = (self.waypoint_index + 1) % len(WAYPOINTS)
@@ -356,23 +324,32 @@ class SeekCat(Node):
         goal.pose.pose.position.x    = x
         goal.pose.pose.position.y    = y
         goal.pose.pose.orientation.w = 1.0
+
         self.nav_client.send_goal_async(goal)
         self.get_logger().info(f'[Nav2] Goal sent: ({x}, {y})')
 
     # ── clustering ────────────────────────────────────────────────────────────
 
     def _cluster_points(self, points, gap=0.3):
+        """
+        Simple single-linkage clustering.
+        Returns list of clusters (each cluster = list of (x,y)).
+        """
         if not points:
             return []
+
         clusters = []
         current  = [points[0]]
+
         for pt in points[1:]:
+            # Find minimum distance to any point in current cluster
             min_dist = min(euclidean(pt, cp) for cp in current)
             if min_dist <= gap:
                 current.append(pt)
             else:
                 clusters.append(current)
                 current = [pt]
+
         clusters.append(current)
         return clusters
 
@@ -380,9 +357,6 @@ class SeekCat(Node):
 
     def stop_robot(self):
         self.cmd_pub.publish(Twist())
-
-    def _publish_status(self, status: str):
-        self.status_pub.publish(String(data=status))
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -398,6 +372,7 @@ def main(args=None):
         node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
