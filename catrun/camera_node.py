@@ -14,7 +14,8 @@ class CameraNode(Node):
 
         pipeline = (
             'nvarguscamerasrc sensor-id=0 ! '
-            'video/x-raw(memory:NVMM), width=1024, height=768, framerate=30/1 ! ' # Was width=1920, height=1080, framerate=60/1
+            'video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! '
+            # Options: 320x240 / 640x480 / 640x360 / 1280x720 / 1920x1080
             'nvvidconv flip-method=2 ! '
             'video/x-raw, format=BGRx ! '
             'videoconvert ! '
