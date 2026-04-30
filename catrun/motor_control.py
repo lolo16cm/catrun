@@ -67,12 +67,12 @@ class MotorControlNode(Node):
         self.right_distance = self.safe_min(right_idx, ranges)
 
     def forward(self):
-    # Left motors forward
-    GPIO.output(IN1, GPIO.HIGH)
-    GPIO.output(IN2, GPIO.LOW)
-    # Right motors forward
-    GPIO.output(IN3, GPIO.HIGH)
-    GPIO.output(IN4, GPIO.LOW)
+        # Left motors forward
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+        # Right motors forward
+        GPIO.output(IN3, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.LOW)
 
     def backward(self):
         # Left motors backward
