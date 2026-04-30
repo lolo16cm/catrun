@@ -67,34 +67,30 @@ class MotorControlNode(Node):
         self.right_distance = self.safe_min(right_idx, ranges)
 
     def forward(self):
-        # Left motors forward
-        GPIO.output(IN1, GPIO.HIGH)
-        GPIO.output(IN2, GPIO.LOW)
-        # Right motors forward
-        GPIO.output(IN3, GPIO.HIGH)
-        GPIO.output(IN4, GPIO.LOW)
+        GPIO.output(IN1, GPIO.LOW)   # 29 LOW  = left not backward
+        GPIO.output(IN2, GPIO.HIGH)  # 31 HIGH = left forward
+        GPIO.output(IN3, GPIO.HIGH)  # 32 HIGH = right forward
+        GPIO.output(IN4, GPIO.LOW)   # 33 LOW  = right not backward
 
     def backward(self):
-        # Left motors backward
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH)
-        # Right motors backward
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH)
+        GPIO.output(IN1, GPIO.HIGH)  # 29 HIGH = left backward
+        GPIO.output(IN2, GPIO.LOW)   # 31 LOW  = left not forward
+        GPIO.output(IN3, GPIO.LOW)   # 32 LOW  = right not forward
+        GPIO.output(IN4, GPIO.HIGH)  # 33 HIGH = right backward
 
     def turn_left(self):
-        # Left motors backward, right motors forward
-        GPIO.output(IN1, GPIO.LOW)
-        GPIO.output(IN2, GPIO.HIGH)
-        GPIO.output(IN3, GPIO.HIGH)
+        # Left backward, right forward
+        GPIO.output(IN1, GPIO.HIGH)  # 29 HIGH = left backward
+        GPIO.output(IN2, GPIO.LOW)
+        GPIO.output(IN3, GPIO.HIGH)  # 32 HIGH = right forward
         GPIO.output(IN4, GPIO.LOW)
 
     def turn_right(self):
-        # Left motors forward, right motors backward
-        GPIO.output(IN1, GPIO.HIGH)
-        GPIO.output(IN2, GPIO.LOW)
+        # Left forward, right backward
+        GPIO.output(IN1, GPIO.LOW)
+        GPIO.output(IN2, GPIO.HIGH)  # 31 HIGH = left forward
         GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH)
+        GPIO.output(IN4, GPIO.HIGH)  # 33 HIGH = right backward
 
     def stop(self):
         GPIO.output(IN1, GPIO.LOW)
