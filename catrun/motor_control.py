@@ -10,10 +10,10 @@ import time
 import math
 
 # Board pin numbers
-IN1 = 31  # was 29
-IN2 = 29  # was 31
-IN3 = 32  # was 32
-IN4 = 33  # was 33
+IN1 = 29
+IN2 = 31
+IN3 = 32
+IN4 = 33
 
 SAFE_DISTANCE = 0.05
 SLOW_DISTANCE = 0.08
@@ -67,28 +67,34 @@ class MotorControlNode(Node):
         self.right_distance = self.safe_min(right_idx, ranges)
 
     def forward(self):
-        GPIO.output(IN1, GPIO.HIGH)
-        GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.HIGH)
-        GPIO.output(IN4, GPIO.LOW)
+    # Left motors forward
+    GPIO.output(IN1, GPIO.HIGH)
+    GPIO.output(IN2, GPIO.LOW)
+    # Right motors forward
+    GPIO.output(IN3, GPIO.HIGH)
+    GPIO.output(IN4, GPIO.LOW)
 
     def backward(self):
+        # Left motors backward
         GPIO.output(IN1, GPIO.LOW)
         GPIO.output(IN2, GPIO.HIGH)
+        # Right motors backward
         GPIO.output(IN3, GPIO.LOW)
         GPIO.output(IN4, GPIO.HIGH)
 
     def turn_left(self):
-        GPIO.output(IN1, GPIO.HIGH)
-        GPIO.output(IN2, GPIO.LOW)
-        GPIO.output(IN3, GPIO.LOW)
-        GPIO.output(IN4, GPIO.HIGH)
-
-    def turn_right(self):
+        # Left motors backward, right motors forward
         GPIO.output(IN1, GPIO.LOW)
         GPIO.output(IN2, GPIO.HIGH)
         GPIO.output(IN3, GPIO.HIGH)
         GPIO.output(IN4, GPIO.LOW)
+
+    def turn_right(self):
+        # Left motors forward, right motors backward
+        GPIO.output(IN1, GPIO.HIGH)
+        GPIO.output(IN2, GPIO.LOW)
+        GPIO.output(IN3, GPIO.LOW)
+        GPIO.output(IN4, GPIO.HIGH)
 
     def stop(self):
         GPIO.output(IN1, GPIO.LOW)
