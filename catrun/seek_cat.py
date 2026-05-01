@@ -563,9 +563,45 @@ class SeekCat(Node):
     # ── stop ──────────────────────────────────────────────────────────────────
 
     def _send_stop(self):
-        """Send stop command to /cat_target."""
-        self.get_logger().info('[Seek] Sending STOP — target not found.')
+        """Send stop command and return robot to home (0,0)."""
+        self.get_logger().info('[Seek] Sending STOP — returning to home (0,0).')
         self.target_pub.publish(String(data='stop'))
+        self._publish_status('returning home')
+        self._return_home()
+
+    def _return_home(self):
+        """Navigate back to origin (0,0)."""
+        if not self.nav_client.server_is_ready():
+            self.get_logger().warn('Nav2 not ready — cannot return home.')
+            self._stop_all()
+            return
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id    = 'map'
+        goal.pose.header.stamp       = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x    = 0.0
+        goal.pose.pose.position.y    = 0.0
+        goal.pose.pose.orientation.w = 1.0
+
+        self.get_logger().info('[Nav2] Returning to home (0.0, 0.0)...')
+
+        future = self.nav_client.send_goal_async(goal)
+        future.add_done_callback(self._home_goal_cb)
+
+    def _home_goal_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Home goal rejected!')
+            self._stop_all()
+            return
+
+        self.get_logger().info('Heading home...')
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._home_result_cb)
+
+    def _home_result_cb(self, future):
+        self.get_logger().info('✅ Arrived home (0,0)!')
+        self._publish_status('home')
         self._stop_all()
 
     def _stop_all(self):
