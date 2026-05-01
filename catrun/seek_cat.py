@@ -389,7 +389,7 @@ class SeekCat(Node):
             self.get_logger().info(
                 f'[YOLO] No result after {SPIN_PAUSE_SEC}s — next object')
             self.object_check_index += 1
-            self.state = self.STATE_CHECK_OBJECTS`
+            self.state = self.STATE_CHECK_OBJECTS
 
     # ── waypoint navigation ───────────────────────────────────────────────────
 
