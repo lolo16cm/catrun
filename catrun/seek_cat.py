@@ -59,6 +59,15 @@ WAYPOINTS = [
     ('L3',  0.297, -0.5),
 ]
 
+# ── constants ─────────────────────────────────────────────────────────────────
+CAMERA_HFOV_DEG    = 63.0                          # IMX477 horizontal FOV
+CAMERA_HFOV_RAD    = math.radians(CAMERA_HFOV_DEG)
+SPIN_STOPS         = math.ceil(360.0 / CAMERA_HFOV_DEG)  # = 6 stops
+SPIN_ANGLE_RAD     = math.radians(360.0 / SPIN_STOPS)    # angle per stop
+SPIN_PAUSE_SEC     = 2.0                           # pause at each stop
+SPIN_TURN_SEC      = SPIN_ANGLE_RAD / ANGULAR_SPEED      # time to turn one stop
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def polar_to_xy(r, angle_rad):
@@ -359,25 +368,28 @@ class SeekCat(Node):
             self.state           = self.STATE_WAITING_YOLO
 
     def _wait_for_yolo(self):
-        """Wait for YOLO result, then move to next object or waypoints."""
-        elapsed = time.time() - self.yolo_wait_start
+        elapsed `= time.time() - self.yolo_wait_start
+
+        # Keep triggering camera during the wait
+        if elapsed % 0.5 < 0.1:
+            self._trigger_camera()
 
         if self.yolo_result is not None:
             if self.yolo_result == self.target_cat:
-                # Found! identity_cb already switched to FOLLOWING
-                return
+                return  # identity_cb already switched to FOLLOWING
             else:
                 self.get_logger().info(
                     f'[YOLO] Got "{self.yolo_result}", '
-                    f'not target "{self.target_cat}" — trying next object')
+                    f'not "{self.target_cat}" — next object')
                 self.object_check_index += 1
+                self.yolo_result = None
                 self.state = self.STATE_CHECK_OBJECTS
 
-        elif elapsed > YOLO_WAIT_TIMEOUT:
+        elif elapsed > SPIN_PAUSE_SEC:  # use same 2s pause
             self.get_logger().info(
-                f'[YOLO] Timeout after {YOLO_WAIT_TIMEOUT}s — trying next object')
+                f'[YOLO] No result after {SPIN_PAUSE_SEC}s — next object')
             self.object_check_index += 1
-            self.state = self.STATE_CHECK_OBJECTS
+            self.state = self.STATE_CHECK_OBJECTS`
 
     # ── waypoint navigation ───────────────────────────────────────────────────
 
@@ -413,22 +425,76 @@ class SeekCat(Node):
             self.state = self.STATE_WAYPOINT_SPIN
 
     def _spin_at_waypoint(self):
-        elapsed = (self.get_clock().now() - self.spin_start).nanoseconds / 1e9
+        """
+        Rotate 360° in SPIN_STOPS steps.
+        At each stop: pause SPIN_PAUSE_SEC and trigger YOLO.
+        """
+        now = time.time()
 
-        if elapsed < WAYPOINT_SPIN_DURATION:
-            twist = Twist()
-            twist.angular.z = ANGULAR_SPEED
-            self.cmd_pub.publish(twist)
-            self._trigger_camera()
-        else:
-            label = WAYPOINTS[self.waypoint_index][0]
-            self.get_logger().info(
-                f'[Search] {self.target_cat} not at {label}')
-            self.stop_robot()
-            self.waypoint_index += 1
-            self.nav_sent        = False
-            self.spin_start      = None
-            self.state           = self.STATE_WAYPOINT_NAV
+        # Initialise sub-state on first entry
+        if not hasattr(self, '_spin_stop_idx'):
+            self._spin_stop_idx   = 0
+            self._spin_phase      = 'turning'   # 'turning' | 'pausing'
+            self._spin_phase_start = now
+
+        label = WAYPOINTS[self.waypoint_index][0]
+
+        # ── turning phase ─────────────────────────────────────────────────────
+        if self._spin_phase == 'turning':
+            elapsed = now - self._spin_phase_start
+            if elapsed < SPIN_TURN_SEC:
+                twist = Twist()
+                twist.angular.z = ANGULAR_SPEED
+                self.cmd_pub.publish(twist)
+            else:
+                # Finished turning one stop — pause
+                self.stop_robot()
+                self._spin_phase       = 'pausing'
+                self._spin_phase_start = now
+                self.yolo_result       = None
+                self._trigger_camera()
+                self.get_logger().info(
+                    f'[Spin] Stop {self._spin_stop_idx+1}/{SPIN_STOPS} '
+                    f'at {label} — pausing {SPIN_PAUSE_SEC}s for YOLO')
+
+        # ── pausing phase ─────────────────────────────────────────────────────
+        elif self._spin_phase == 'pausing':
+            elapsed = now - self._spin_phase_start
+
+            # Check if YOLO found the target during pause
+            if self.yolo_result == self.target_cat:
+                self.get_logger().info(
+                    f'[Spin] Found {self.target_cat} at stop '
+                    f'{self._spin_stop_idx+1}!')
+                self._reset_spin_state()
+                # identity_cb already switches to FOLLOWING
+                return
+
+            if elapsed >= SPIN_PAUSE_SEC:
+                self._spin_stop_idx += 1
+
+                if self._spin_stop_idx >= SPIN_STOPS:
+                    # Full 360° done — not found here
+                    self.get_logger().info(
+                        f'[Spin] Full 360° at {label} — {self.target_cat} not found')
+                    self._reset_spin_state()
+                    self.stop_robot()
+                    self.waypoint_index += 1
+                    self.nav_sent        = False
+                    self.spin_start      = None
+                    self.state           = self.STATE_WAYPOINT_NAV
+                else:
+                    # Next stop
+                    self._spin_phase       = 'turning'
+                    self._spin_phase_start = now
+
+    def _reset_spin_state(self):
+        if hasattr(self, '_spin_stop_idx'):
+            del self._spin_stop_idx
+        if hasattr(self, '_spin_phase'):
+            del self._spin_phase
+        if hasattr(self, '_spin_phase_start'):
+            del self._spin_phase_start
 
     # ── follow behavior ───────────────────────────────────────────────────────
 
