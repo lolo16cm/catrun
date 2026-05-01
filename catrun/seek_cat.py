@@ -505,26 +505,32 @@ class SeekCat(Node):
         twist = Twist()
         error = self.cat_cx - 0.5
 
-        # Angular steering
+        # Angular steering — same direction
         twist.angular.z = -ANGULAR_SPEED * (error / 0.5)
 
-        # Linear — maintain 1 foot distance
+        # Linear — camera faces BACK so move BACKWARD to follow
         dist = self.cat_dist if self.cat_dist is not None else self.front_distance
 
         if dist < FOLLOW_DIST_MIN:
-            twist.linear.x = -0.10
+            # Too close — move FORWARD (away from cat)
+            twist.linear.x = 0.10
             self.get_logger().info(
-                f'Too close ({dist:.2f}m) — backing up',
+                f'Too close ({dist:.2f}m) — moving forward',
                 throttle_duration_sec=1.0)
+
         elif dist > FOLLOW_DIST_MAX:
+            # Too far — move BACKWARD (toward cat)
             speed = min(FOLLOW_SPEED_MAX,
                         FOLLOW_SPEED_MAX * (dist - FOLLOW_DIST_TARGET) / 0.3)
-            twist.linear.x = speed if abs(error) < CENTER_THRESH else 0.0
+            twist.linear.x = -speed if abs(error) < CENTER_THRESH else 0.0
             self.get_logger().info(
-                f'Following ({dist:.2f}m)',
+                f'Following backward ({dist:.2f}m)',
                 throttle_duration_sec=1.0)
+
         elif FOLLOW_DIST_MIN <= dist <= FOLLOW_DIST_TARGET:
-            twist.linear.x = 0.05 if abs(error) < CENTER_THRESH else 0.0
+            # In sweet spot — slow backward approach
+            twist.linear.x = -0.05 if abs(error) < CENTER_THRESH else 0.0
+
         else:
             twist.linear.x = 0.0
 
