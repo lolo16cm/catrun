@@ -368,7 +368,7 @@ class SeekCat(Node):
             self.state           = self.STATE_WAITING_YOLO
 
     def _wait_for_yolo(self):
-        elapsed `= time.time() - self.yolo_wait_start
+        elapsed = time.time() - self.yolo_wait_start
 
         # Keep triggering camera during the wait
         if elapsed % 0.5 < 0.1:
