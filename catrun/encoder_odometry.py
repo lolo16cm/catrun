@@ -42,7 +42,7 @@ RR_B = 23
 # ── Robot specs ───────────────────────────────────────────────────────────────
 WHEEL_DIAMETER  = 0.065          # meters
 WHEEL_RADIUS    = WHEEL_DIAMETER / 2.0
-TRACK_WIDTH     = 0.110          # meters
+TRACK_WIDTH     = 0.170          # meters
 PPR_BASE        = 7              # pulses per revolution (base)
 GEAR_RATIO      = 150            # gear reduction ratio
 PPR_TOTAL       = PPR_BASE * GEAR_RATIO * 4  # x4 for quadrature = 4200
