@@ -28,6 +28,16 @@ class MotorControlNode(Node):
         os.system("sudo busybox devmem 0x2430070 w 0x5")  # pin 31 IN2
         os.system("sudo busybox devmem 0x2434080 w 0x5")  # pin 32 IN3
         os.system("sudo busybox devmem 0x2434040 w 0x5")  # pin 33 IN4
+
+        # Add these to your devmem setup
+        os.system("sudo busybox devmem 0x2430050 w 0x5")  # PIN 11
+        os.system("sudo busybox devmem 0x2430058 w 0x5")  # PIN 13
+        os.system("sudo busybox devmem 0x2440020 w 0x5")  # PIN 15
+        os.system("sudo busybox devmem 0x243D020 w 0x5")  # PIN 16
+        os.system("sudo busybox devmem 0x243D040 w 0x5")  # PIN 19
+        os.system("sudo busybox devmem 0x2434090 w 0x5")  # PIN 21
+        os.system("sudo busybox devmem 0x2434088 w 0x5")  # PIN 22
+        os.system("sudo busybox devmem 0x24340A0 w 0x5")  # PIN 23
         time.sleep(0.5)
 
         # Setup GPIO

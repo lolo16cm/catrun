@@ -33,19 +33,11 @@ def generate_launch_description():
         ),
 
         # Terminal 4 — rf2o odometry
-        # IncludeLaunchDescription(
-        #     PythonLaunchDescriptionSource(
-        #         os.path.join(rf2o_dir, 'launch',
-        #                      'rf2o_laser_odometry.launch.py')
-        #     ),
-        # ),
-        # Remove rf2o IncludeLaunchDescription - Terminal 4
-        # Add instead:
-        Node(
-            package='catrun',
-            executable='encoder_odometry',
-            name='encoder_odometry',
-            output='screen',
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(rf2o_dir, 'launch',
+                             'rf2o_laser_odometry.launch.py')
+            ),
         ),
 
         # Terminal 5 — Nav2 + AMCL + map (delayed 3s to let TF settle)

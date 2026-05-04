@@ -35,6 +35,7 @@ setup(
             'web_stream = catrun.web_stream:main',
             'cat_detector = catrun.cat_detector:main',
             'seek_cat = catrun.seek_cat:main',
+            'encoder_odometry = catrun.encoder_odometry:main',
         ],
     },
 )
