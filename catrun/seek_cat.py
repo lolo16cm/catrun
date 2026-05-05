@@ -108,6 +108,7 @@ class SeekCat(Node):
         self.active        = False
         self.state         = self.STATE_IDLE
         self.following     = False
+        self.nav_arrived = False
 
         # Moving objects detected by LiDAR — list of (angle_rad, dist)
         self.moving_objects     = []
@@ -410,12 +411,20 @@ class SeekCat(Node):
         label, wx, wy = WAYPOINTS[self.waypoint_index]
 
         if not self.nav_sent:
+            self.nav_arrived = False
             self.get_logger().info(
                 f'[Search] Heading to {label} ({wx}, {wy}) '
                 f'[cycle {self.search_cycles+1}/{MAX_SEARCH_CYCLES}]')
             self._send_nav_goal(wx, wy)
             self.nav_sent   = True
             self.spin_start = None
+            return
+
+        # Wait until actually arrived before spinning
+        if not self.nav_arrived:
+            self.get_logger().info(
+                f'[Nav2] Waiting to arrive at {label}...',
+                throttle_duration_sec=3.0)
             return
 
         # Nav sent — transition to spinning
@@ -550,8 +559,30 @@ class SeekCat(Node):
         goal.pose.pose.position.x    = x
         goal.pose.pose.position.y    = y
         goal.pose.pose.orientation.w = 1.0
-        self.nav_client.send_goal_async(goal)
+
+        self.nav_arrived  = False  # reset arrival flag
+        future = self.nav_client.send_goal_async(goal)
+        future.add_done_callback(self._nav_goal_accepted_cb)        
         self.get_logger().info(f'[Nav2] Goal sent: ({x}, {y})')
+
+    def _nav_goal_accepted_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Nav2 goal rejected!')
+            self.nav_sent = False
+            return
+        self.get_logger().info('[Nav2] Goal accepted, navigating...')
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._nav_result_cb)
+
+    def _nav_result_cb(self, future):
+        status = future.result().status
+        if status == 4:  # SUCCEEDED
+            self.get_logger().info('[Nav2] ✅ Arrived at waypoint!')
+            self.nav_arrived = True
+        else:
+            self.get_logger().warn(f'[Nav2] Goal failed status={status}, retrying...')
+            self.nav_sent = False
 
     # ── camera trigger ────────────────────────────────────────────────────────
 
