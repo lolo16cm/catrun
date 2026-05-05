@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
 """
-seek_cat.py
-1. Detect moving objects with LiDAR
-2. Turn camera (mounted at back) toward each object and check with YOLO
-3. If not found after checking all objects → navigate to 3 waypoints and rotate
-4. After 3 full search cycles with no results → send stop
+seek_cat.py  –  revised
+========================
+State machine:
+  IDLE          → waiting for /cat_target
+  SCAN_OBJECTS  → LiDAR found moving objects → turn camera (back-facing) toward
+                  each one and wait for YOLO result
+  NAVIGATE      → no moving objects (or all checked) → drive to next waypoint
+  SPIN_AT_WP    → arrived at waypoint → spin 360° looking for cat
+  FOUND         → target confirmed → stop everything and publish "found"
+  DONE          → 3 full cycles with no result → publish "stop"
+
+Key fixes vs previous version
+-------------------------------
+1. FOUND state cancels the active Nav2 goal and stops /cmd_vel immediately.
+2. Camera-turn phase (SCAN_OBJECTS) directly publishes angular /cmd_vel to
+   rotate the robot so the BACK-mounted camera faces the moving object, then
+   waits up to YOLO_WAIT_TIMEOUT seconds for a /cat_identity message.
+3. Nav2 retries are capped: each waypoint is retried at most MAX_NAV_RETRIES
+   times before moving on, preventing the infinite status=6 loop.
 """
 
 import math
@@ -14,42 +28,31 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
-from geometry_msgs.msg import PointStamped, Twist
+from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 # ── tunables ──────────────────────────────────────────────────────────────────
+ANGULAR_SPEED        = 0.4     # rad/s for camera-turn and waypoint spin
+SPIN_DURATION        = 5.0     # seconds to spin at each waypoint
+YOLO_WAIT_TIMEOUT    = 3.5     # seconds to wait for YOLO after turning to object
+CAMERA_OFFSET_RAD    = math.pi # camera is at BACK → add 180° to face it at object
 
-LINEAR_SPEED    = 0.15
-ANGULAR_SPEED   = 0.4
-CENTER_THRESH   = 0.12
-LOST_TIMEOUT    = 5.0
-SPIN_DURATION   = 4.0
-
-# Follow distance ~1 foot
-FOLLOW_DIST_TARGET = 0.30
-FOLLOW_DIST_MIN    = 0.20
-FOLLOW_DIST_MAX    = 0.50
-FOLLOW_SPEED_MAX   = 0.20
+# After any motion stops, ignore YOLO results for this long so in-flight
+# frames from the previous view are flushed before we accept a detection.
+CAMERA_SETTLE_DELAY  = 1.0     # seconds  (tune up if you still see false misses)
 
 # LiDAR motion detection
-MOTION_DIST_THRESH = 0.15
-CLUSTER_MIN_POINTS = 3
-CAT_SIZE_MIN       = 0.10
-CAT_SIZE_MAX       = 0.60
-CAT_DIST_MAX       = 3.0
+MOTION_DIST_THRESH   = 0.15    # metres change = "moving"
+CLUSTER_MIN_POINTS   = 3
+CAT_DIST_MAX         = 3.0     # ignore objects farther than this
 
-# Camera is at BACK of robot → add 180° offset when turning toward object
-CAMERA_OFFSET_RAD  = math.pi   # 180 degrees
+# Nav2 reliability
+MAX_NAV_RETRIES      = 2       # give up on a waypoint after this many status=6
+NAV_GOAL_TIMEOUT     = 25.0    # seconds before declaring a nav goal timed-out
 
-# How long to wait for YOLO result after turning toward object
-YOLO_WAIT_TIMEOUT  = 3.0   # seconds
-
-# How long to rotate at each waypoint
-WAYPOINT_SPIN_DURATION = 4.0
-
-# Max full search cycles before sending stop
-MAX_SEARCH_CYCLES  = 3
+# Search cycles
+MAX_SEARCH_CYCLES    = 3
 
 KNOWN_CATS = {'eevee', 'raichu', 'pichu'}
 
@@ -59,498 +62,319 @@ WAYPOINTS = [
     ('L3',  0.297, -0.5),
 ]
 
-# ── constants ─────────────────────────────────────────────────────────────────
-CAMERA_HFOV_DEG    = 63.0                          # IMX477 horizontal FOV
-CAMERA_HFOV_RAD    = math.radians(CAMERA_HFOV_DEG)
-SPIN_STOPS         = math.ceil(360.0 / CAMERA_HFOV_DEG)  # = 6 stops
-SPIN_ANGLE_RAD     = math.radians(360.0 / SPIN_STOPS)    # angle per stop
-SPIN_PAUSE_SEC     = 2.0                           # pause at each stop
-SPIN_TURN_SEC      = SPIN_ANGLE_RAD / ANGULAR_SPEED      # time to turn one stop
-
+# ── states ────────────────────────────────────────────────────────────────────
+IDLE         = 'IDLE'
+SCAN_OBJECTS = 'SCAN_OBJECTS'
+NAVIGATE     = 'NAVIGATE'
+SPIN_AT_WP   = 'SPIN_AT_WP'
+FOUND        = 'FOUND'
+DONE         = 'DONE'
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
 def polar_to_xy(r, angle_rad):
     return r * math.cos(angle_rad), r * math.sin(angle_rad)
 
-def cluster_width(points):
-    if not points:
-        return 0.0
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return math.sqrt((max(xs)-min(xs))**2 + (max(ys)-min(ys))**2)
-
-def euclidean(p1, p2):
-    return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
-
 def angle_to_object(x, y):
-    """Angle from robot to object in robot frame."""
+    """Bearing from robot-centre to (x, y) in robot frame."""
     return math.atan2(y, x)
 
-# ── node ──────────────────────────────────────────────────────────────────────
 
 class SeekCat(Node):
-
-    # ── states ────────────────────────────────────────────────────────────────
-    STATE_IDLE          = 'idle'
-    STATE_CHECK_OBJECTS = 'check_objects'   # turning toward moving objects
-    STATE_TURNING       = 'turning'         # currently turning toward an object
-    STATE_WAITING_YOLO  = 'waiting_yolo'    # waiting for YOLO result
-    STATE_WAYPOINT_NAV  = 'waypoint_nav'    # navigating to waypoint
-    STATE_WAYPOINT_SPIN = 'waypoint_spin'   # spinning at waypoint
-    STATE_FOLLOWING     = 'following'       # following found cat
 
     def __init__(self):
         super().__init__('seek_cat')
 
         # ── core state ────────────────────────────────────────────────────────
-        self.target_cat    = None
-        self.active        = False
-        self.state         = self.STATE_IDLE
-        self.following     = False
-        self.nav_arrived = False
+        self.state          = IDLE
+        self.target_cat     = None
+        self.active         = False
 
-        # Moving objects detected by LiDAR — list of (angle_rad, dist)
-        self.moving_objects     = []
-        self.object_check_index = 0   # which object we're currently checking
-
-        # Turning state
-        self.turn_target_angle  = None   # desired robot yaw offset
+        # Moving-object inspection
+        self.moving_objects     = []   # list of (angle_rad, dist) in robot frame
+        self.obj_index          = 0    # which object we are currently checking
         self.turn_start_time    = None
-        self.turn_duration      = 1.5    # seconds per 90° turn (tune this)
-
-        # YOLO wait state
+        self.turn_target_angle  = None # radians to rotate (positive = CCW)
+        self.turned_enough      = False
+        self.camera_settle_start = None  # when motors stopped; flush stale frames
         self.yolo_wait_start    = None
-        self.yolo_result        = None   # set by identity_cb
+        self.last_identity      = None
 
-        # Waypoint search state
-        self.waypoint_index     = 0
-        self.nav_sent           = False
-        self.spin_start         = None
-        self.search_cycles      = 0      # counts full L1→L2→L3 cycles
+        # Waypoint navigation
+        self.waypoint_index  = 0
+        self.search_cycle    = 0
+        self.nav_goal_handle = None
+        self.nav_sent        = False
+        self.nav_send_time   = None
+        self.nav_retries     = 0
 
-        # Follow state
-        self.last_seen          = None
-        self.cat_cx             = None
-        self.cat_dist           = None
+        # Spin-at-waypoint
+        self.spin_start      = None
 
-        # LiDAR
-        self.prev_scan          = None
-        self.front_distance     = float('inf')
-        self.last_scan_time     = 0.0
+        # Previous LiDAR scan for motion detection
+        self._prev_ranges    = None
+        self._prev_scan_time = None
 
-        # Nav2
+        # ── Nav2 action client ────────────────────────────────────────────────
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         # ── subscriptions ─────────────────────────────────────────────────────
-        self.create_subscription(String,       '/cat_target',   self.target_cb,   10)
-        self.create_subscription(String,       '/cat_identity', self.identity_cb, 10)
-        self.create_subscription(PointStamped, '/cat_position', self.position_cb, 10)
-        self.create_subscription(LaserScan,    '/scan',         self.scan_cb,     10)
+        self.create_subscription(String,    '/cat_target',   self._cb_target,   10)
+        self.create_subscription(String,    '/cat_identity', self._cb_identity, 10)
+        self.create_subscription(LaserScan, '/scan',         self._cb_scan,     10)
 
-        # ── publishers ────────────────────────────────────────────────────────
-        self.cmd_pub            = self.create_publisher(Twist,  '/cmd_vel',              10)
-        self.camera_trigger_pub = self.create_publisher(String, '/camera_check_trigger', 10)
-        self.target_pub         = self.create_publisher(String, '/cat_target',           10)
-        self.status_pub         = self.create_publisher(String, '/seek_status',          10)
+        # ── publications ──────────────────────────────────────────────────────
+        self.cmd_pub    = self.create_publisher(Twist, '/cmd_vel',     10)
+        self.status_pub = self.create_publisher(String, '/seek_status', 10)
 
-        self.create_timer(0.1, self.control_loop)
+        # ── main loop at 10 Hz ────────────────────────────────────────────────
+        self.create_timer(0.1, self._loop)
 
-        self.get_logger().info(
-            f'SeekCat ready. Known: {KNOWN_CATS}. '
-            'Waiting for /cat_target ...'
-        )
+        self.get_logger().info('SeekCat ready – waiting for /cat_target')
 
-    # ── callbacks ─────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Callbacks
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def target_cb(self, msg: String):
+    def _cb_target(self, msg: String):
         text = msg.data.strip().lower()
         if text in ('', 'stop', 'none'):
-            self._stop_all()
+            self._reset()
+            self.get_logger().info('[Target] Seek stopped.')
             return
-        if text not in KNOWN_CATS:
-            self.get_logger().warn(f'Unknown cat "{text}"')
+        if text in KNOWN_CATS:
+            self.target_cat = text
+            self.active     = True
+            if self.state == IDLE:
+                self._enter_scan()
+            self.get_logger().info(f'[Target] Seeking: {self.target_cat}')
+
+    def _cb_identity(self, msg: String):
+        """YOLO result from cat_detector – used during SCAN_OBJECTS."""
+        self.last_identity = msg.data.strip().lower()
+
+    def _cb_scan(self, msg: LaserScan):
+        """Detect moving objects by comparing consecutive scans."""
+        now = time.time()
+        ranges = list(msg.ranges)
+        n      = len(ranges)
+
+        if self._prev_ranges is None or len(self._prev_ranges) != n:
+            self._prev_ranges    = ranges
+            self._prev_scan_time = now
             return
 
-        self.target_cat      = text
-        self.active          = True
-        self.following       = False
-        self.search_cycles   = 0
-        self.waypoint_index  = 0
-        self.nav_sent        = False
-        self.last_seen       = None
-        self.cat_cx          = None
-        self.cat_dist        = None
-        self.moving_objects  = []
-        self.object_check_index = 0
-        self.state           = self.STATE_CHECK_OBJECTS
-        self.get_logger().info(f'Seeking: {self.target_cat}')
-        self._publish_status(f'seeking {self.target_cat}')
+        dt = now - self._prev_scan_time
+        if dt < 0.1:          # wait at least 100 ms between comparisons
+            return
 
-    def identity_cb(self, msg: String):
-        """Called when YOLO identifies a cat."""
-        name = msg.data.strip().lower()
-        self.yolo_result = name
+        angle_min = msg.angle_min
+        angle_inc = msg.angle_increment
+        moving    = []
 
-        if self.target_cat and name == self.target_cat:
-            self.last_seen = self.get_clock().now()
+        for i, (r_new, r_old) in enumerate(zip(ranges, self._prev_ranges)):
+            if not math.isfinite(r_new) or not math.isfinite(r_old):
+                continue
+            if r_new > CAT_DIST_MAX:
+                continue
+            if abs(r_new - r_old) > MOTION_DIST_THRESH:
+                angle = angle_min + i * angle_inc
+                moving.append((angle, r_new))
+
+        self._prev_ranges    = ranges
+        self._prev_scan_time = now
+
+        # Cluster the moving points into distinct objects
+        if self.state == IDLE or not self.active:
+            return
+
+        clusters = self._cluster(moving)
+        if clusters:
+            self.moving_objects = clusters   # update continuously
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Main control loop
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _loop(self):
+        if self.state == IDLE or self.state == DONE:
+            return
+
+        # ── FOUND: stop everything ────────────────────────────────────────────
+        if self.state == FOUND:
+            self._stop_motors()
+            return
+
+        # ── SCAN_OBJECTS ──────────────────────────────────────────────────────
+        if self.state == SCAN_OBJECTS:
+            self._loop_scan_objects()
+            return
+
+        # ── NAVIGATE ─────────────────────────────────────────────────────────
+        if self.state == NAVIGATE:
+            self._loop_navigate()
+            return
+
+        # ── SPIN_AT_WP ────────────────────────────────────────────────────────
+        if self.state == SPIN_AT_WP:
+            self._loop_spin_at_wp()
+            return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # State: SCAN_OBJECTS
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _enter_scan(self):
+        if self.moving_objects:
+            self.state     = SCAN_OBJECTS
+            self.obj_index = 0
+            self._start_turn_to_object(self.obj_index)
             self.get_logger().info(
-                f'✅ Found {self.target_cat}! Switching to follow.')
-            self.state     = self.STATE_FOLLOWING
-            self.following = True
-            self.nav_sent  = False
-            self.stop_robot()
-            self._publish_status(f'following {self.target_cat}')
-
-    def position_cb(self, msg: PointStamped):
-        self.cat_cx    = msg.point.x
-        self.last_seen = self.get_clock().now()
-        if not self.following and self.active:
-            self.following = True
-            self.state     = self.STATE_FOLLOWING
-            self._publish_status(f'following {self.target_cat}')
-
-    def scan_cb(self, scan: LaserScan):
-        # Update front distance
-        ranges = scan.ranges
-        n = len(ranges)
-        front_idx = list(range(0, n//12)) + list(range(11*n//12, n))
-        front_vals = [ranges[i] for i in front_idx
-                      if scan.range_min < ranges[i] < scan.range_max
-                      and not math.isinf(ranges[i])]
-        self.front_distance = min(front_vals) if front_vals else float('inf')
-
-        if not self.active:
-            self.prev_scan = scan
-            return
-
-        if self.prev_scan is None:
-            self.prev_scan = scan
-            return
-
-        # Detect moving objects
-        moving_pts = []
-        n = min(len(scan.ranges), len(self.prev_scan.ranges))
-        for i in range(n):
-            r_now  = scan.ranges[i]
-            r_prev = self.prev_scan.ranges[i]
-            if not (scan.range_min < r_now  < min(scan.range_max, CAT_DIST_MAX)):
-                continue
-            if not (scan.range_min < r_prev < min(scan.range_max, CAT_DIST_MAX)):
-                continue
-            if abs(r_now - r_prev) > MOTION_DIST_THRESH:
-                angle = scan.angle_min + i * scan.angle_increment
-                x, y  = polar_to_xy(r_now, angle)
-                moving_pts.append((x, y, angle, r_now))
-
-        self.prev_scan = scan
-
-        if not moving_pts:
-            return
-
-        # Cluster moving points
-        pts_xy = [(p[0], p[1]) for p in moving_pts]
-        clusters = self._cluster_points(pts_xy, gap=0.3)
-
-        new_objects = []
-        for cluster in clusters:
-            if len(cluster) < CLUSTER_MIN_POINTS:
-                continue
-            width = cluster_width(cluster)
-            if CAT_SIZE_MIN <= width <= CAT_SIZE_MAX:
-                # Cluster center
-                cx = sum(p[0] for p in cluster) / len(cluster)
-                cy = sum(p[1] for p in cluster) / len(cluster)
-                dist  = math.sqrt(cx**2 + cy**2)
-                angle = math.atan2(cy, cx)
-                new_objects.append((angle, dist))
-
-        if new_objects and self.state == self.STATE_IDLE:
-            # New moving objects detected — start checking them
-            self.moving_objects     = new_objects
-            self.object_check_index = 0
-            self.state              = self.STATE_CHECK_OBJECTS
-            self.get_logger().info(
-                f'[LiDAR] {len(new_objects)} moving object(s) detected!')
-
-        elif new_objects and self.state == self.STATE_CHECK_OBJECTS:
-            # Update object list while checking
-            self.moving_objects = new_objects
-
-    # ── control loop ──────────────────────────────────────────────────────────
-
-    def control_loop(self):
-        if not self.active or self.target_cat is None:
-            return
-
-        # ── FOLLOWING ─────────────────────────────────────────────────────────
-        if self.state == self.STATE_FOLLOWING:
-            if self.last_seen is not None:
-                elapsed = (self.get_clock().now() - self.last_seen).nanoseconds / 1e9
-                if elapsed < LOST_TIMEOUT:
-                    self.follow_cat()
-                    return
-                else:
-                    self.get_logger().info(f'{self.target_cat} lost! Searching...')
-                    self.following = False
-                    self.state     = self.STATE_CHECK_OBJECTS
-                    self.moving_objects     = []
-                    self.object_check_index = 0
-                    self._publish_status(f'lost {self.target_cat}')
-            return
-
-        # ── CHECK MOVING OBJECTS ───────────────────────────────────────────────
-        if self.state == self.STATE_CHECK_OBJECTS:
-            if self.object_check_index < len(self.moving_objects):
-                # Turn toward next object
-                angle, dist = self.moving_objects[self.object_check_index]
-                # Camera is at back → turn robot so back faces the object
-                turn_angle = angle + CAMERA_OFFSET_RAD
-                self.get_logger().info(
-                    f'[Check] Object {self.object_check_index+1}/'
-                    f'{len(self.moving_objects)} at angle={math.degrees(angle):.1f}° '
-                    f'dist={dist:.2f}m — turning camera toward it')
-                self._start_turn(turn_angle)
-                self.state = self.STATE_TURNING
-            else:
-                # No more objects to check → go to waypoints
-                self.get_logger().info(
-                    '[Check] All objects checked, none matched. '
-                    'Navigating to waypoints...')
-                self.state          = self.STATE_WAYPOINT_NAV
-                self.nav_sent       = False
-
-        # ── TURNING ───────────────────────────────────────────────────────────
-        elif self.state == self.STATE_TURNING:
-            self._execute_turn()
-
-        # ── WAITING FOR YOLO ──────────────────────────────────────────────────
-        elif self.state == self.STATE_WAITING_YOLO:
-            self._wait_for_yolo()
-
-        # ── WAYPOINT NAVIGATION ───────────────────────────────────────────────
-        elif self.state == self.STATE_WAYPOINT_NAV:
-            self._navigate_waypoint()
-
-        # ── WAYPOINT SPINNING ─────────────────────────────────────────────────
-        elif self.state == self.STATE_WAYPOINT_SPIN:
-            self._spin_at_waypoint()
-
-    # ── turning toward object ─────────────────────────────────────────────────
-
-    def _start_turn(self, angle_rad):
-        """Start turning robot by angle_rad."""
-        self.turn_target_angle = angle_rad
-        self.turn_start_time   = time.time()
-        # Estimate turn duration based on angle
-        self.turn_duration = abs(angle_rad) / ANGULAR_SPEED
-        self.turn_duration = max(0.5, min(self.turn_duration, 4.0))
-        self.yolo_result   = None
-
-    def _execute_turn(self):
-        """Execute the turn then trigger YOLO."""
-        elapsed = time.time() - self.turn_start_time
-
-        if elapsed < self.turn_duration:
-            twist = Twist()
-            # Turn direction based on angle sign
-            if self.turn_target_angle > 0:
-                twist.angular.z = ANGULAR_SPEED
-            else:
-                twist.angular.z = -ANGULAR_SPEED
-            self.cmd_pub.publish(twist)
+                f'[Scan] {len(self.moving_objects)} moving object(s) detected – inspecting...')
         else:
-            # Turn complete — stop and trigger YOLO
-            self.stop_robot()
-            self.get_logger().info('[Turn] Complete — triggering YOLO check')
-            self._trigger_camera()
-            self.yolo_wait_start = time.time()
-            self.yolo_result     = None
-            self.state           = self.STATE_WAITING_YOLO
+            self._enter_navigate()
 
-    def _wait_for_yolo(self):
-        elapsed = time.time() - self.yolo_wait_start
-
-        # Keep triggering camera during the wait
-        if elapsed % 0.5 < 0.1:
-            self._trigger_camera()
-
-        if self.yolo_result is not None:
-            if self.yolo_result == self.target_cat:
-                return  # identity_cb already switched to FOLLOWING
-            else:
-                self.get_logger().info(
-                    f'[YOLO] Got "{self.yolo_result}", '
-                    f'not "{self.target_cat}" — next object')
-                self.object_check_index += 1
-                self.yolo_result = None
-                self.state = self.STATE_CHECK_OBJECTS
-
-        elif elapsed > SPIN_PAUSE_SEC:  # use same 2s pause
-            self.get_logger().info(
-                f'[YOLO] No result after {SPIN_PAUSE_SEC}s — next object')
-            self.object_check_index += 1
-            self.state = self.STATE_CHECK_OBJECTS
-
-    # ── waypoint navigation ───────────────────────────────────────────────────
-
-    def _navigate_waypoint(self):
-        if self.waypoint_index >= len(WAYPOINTS):
-            # Completed all waypoints — count as one cycle
-            self.search_cycles  += 1
-            self.waypoint_index  = 0
-            self.get_logger().info(
-                f'[Search] Cycle {self.search_cycles}/{MAX_SEARCH_CYCLES} complete.')
-
-            if self.search_cycles >= MAX_SEARCH_CYCLES:
-                self.get_logger().warn(
-                    f'[Search] {MAX_SEARCH_CYCLES} cycles with no results — stopping.')
-                self._send_stop()
-                return
-
-        label, wx, wy = WAYPOINTS[self.waypoint_index]
-
-        if not self.nav_sent:
-            self.nav_arrived = False
-            self.get_logger().info(
-                f'[Search] Heading to {label} ({wx}, {wy}) '
-                f'[cycle {self.search_cycles+1}/{MAX_SEARCH_CYCLES}]')
-            self._send_nav_goal(wx, wy)
-            self.nav_sent   = True
-            self.spin_start = None
+    def _start_turn_to_object(self, idx):
+        """Begin rotating so the BACK camera faces objects[idx]."""
+        if idx >= len(self.moving_objects):
+            # No more objects → go to waypoints
+            self._enter_navigate()
             return
 
-        # Wait until actually arrived before spinning
-        if not self.nav_arrived:
-            self.get_logger().info(
-                f'[Nav2] Waiting to arrive at {label}...',
-                throttle_duration_sec=3.0)
-            return
+        obj_angle, obj_dist = self.moving_objects[idx]
+        # Camera is at the back → we need to rotate robot by (obj_angle + π)
+        # Normalise to (-π, π]
+        turn = (obj_angle + CAMERA_OFFSET_RAD + math.pi) % (2 * math.pi) - math.pi
 
-        # Nav sent — transition to spinning
-        if self.spin_start is None:
-            self.spin_start = self.get_clock().now()
-            self.get_logger().info(f'[Search] Arrived at {label}, spinning...')
-            self.state = self.STATE_WAYPOINT_SPIN
+        self.turn_target_angle   = turn
+        self.turn_start_time     = time.time()
+        self.turned_enough       = False
+        self.camera_settle_start = None
+        self.yolo_wait_start     = None
+        self.last_identity       = None
 
-    def _spin_at_waypoint(self):
+        self.get_logger().info(
+            f'[Scan] Turning {math.degrees(turn):.1f}° to face object {idx+1} '
+            f'(dist={obj_dist:.2f} m) with back camera')
+
+    def _loop_scan_objects(self):
         """
-        Rotate 360° in SPIN_STOPS steps.
-        At each stop: pause SPIN_PAUSE_SEC and trigger YOLO.
+        Phase 1: rotate until we've turned ~turn_target_angle.
+        Phase 2: settle – motors stopped, discard stale camera frames for
+                 CAMERA_SETTLE_DELAY seconds so the pipeline catches up.
+        Phase 3: accept YOLO result for up to YOLO_WAIT_TIMEOUT seconds.
         """
         now = time.time()
 
-        # Initialise sub-state on first entry
-        if not hasattr(self, '_spin_stop_idx'):
-            self._spin_stop_idx   = 0
-            self._spin_phase      = 'turning'   # 'turning' | 'pausing'
-            self._spin_phase_start = now
+        if not self.turned_enough:
+            elapsed    = now - self.turn_start_time
+            target     = abs(self.turn_target_angle)
+            est_turned = elapsed * ANGULAR_SPEED
 
-        label = WAYPOINTS[self.waypoint_index][0]
-
-        # ── turning phase ─────────────────────────────────────────────────────
-        if self._spin_phase == 'turning':
-            elapsed = now - self._spin_phase_start
-            if elapsed < SPIN_TURN_SEC:
+            direction = 1.0 if self.turn_target_angle >= 0 else -1.0
+            if est_turned < target:
                 twist = Twist()
-                twist.angular.z = ANGULAR_SPEED
+                twist.angular.z = direction * ANGULAR_SPEED
                 self.cmd_pub.publish(twist)
+                return
             else:
-                # Finished turning one stop — pause
-                self.stop_robot()
-                self._spin_phase       = 'pausing'
-                self._spin_phase_start = now
-                self.yolo_result       = None
-                self._trigger_camera()
+                # Motors stop → enter settle phase
+                self._stop_motors()
+                self.turned_enough       = True
+                self.camera_settle_start = now
+                self.last_identity       = None  # discard anything queued before stop
                 self.get_logger().info(
-                    f'[Spin] Stop {self._spin_stop_idx+1}/{SPIN_STOPS} '
-                    f'at {label} — pausing {SPIN_PAUSE_SEC}s for YOLO')
-
-        # ── pausing phase ─────────────────────────────────────────────────────
-        elif self._spin_phase == 'pausing':
-            elapsed = now - self._spin_phase_start
-
-            # Check if YOLO found the target during pause
-            if self.yolo_result == self.target_cat:
-                self.get_logger().info(
-                    f'[Spin] Found {self.target_cat} at stop '
-                    f'{self._spin_stop_idx+1}!')
-                self._reset_spin_state()
-                # identity_cb already switches to FOLLOWING
+                    f'[Scan] Turned – settling {CAMERA_SETTLE_DELAY}s for camera...')
                 return
 
-            if elapsed >= SPIN_PAUSE_SEC:
-                self._spin_stop_idx += 1
-
-                if self._spin_stop_idx >= SPIN_STOPS:
-                    # Full 360° done — not found here
-                    self.get_logger().info(
-                        f'[Spin] Full 360° at {label} — {self.target_cat} not found')
-                    self._reset_spin_state()
-                    self.stop_robot()
-                    self.waypoint_index += 1
-                    self.nav_sent        = False
-                    self.spin_start      = None
-                    self.state           = self.STATE_WAYPOINT_NAV
-                else:
-                    # Next stop
-                    self._spin_phase       = 'turning'
-                    self._spin_phase_start = now
-
-    def _reset_spin_state(self):
-        if hasattr(self, '_spin_stop_idx'):
-            del self._spin_stop_idx
-        if hasattr(self, '_spin_phase'):
-            del self._spin_phase
-        if hasattr(self, '_spin_phase_start'):
-            del self._spin_phase_start
-
-    # ── follow behavior ───────────────────────────────────────────────────────
-
-    def follow_cat(self):
-        if self.cat_cx is None:
+        # Phase 2: settle – flush stale identities every tick until delay expires
+        if now - self.camera_settle_start < CAMERA_SETTLE_DELAY:
+            self.last_identity = None
             return
 
-        twist = Twist()
-        error = self.cat_cx - 0.5
+        # Phase 3: YOLO wait (start timer once, after settle completes)
+        if self.yolo_wait_start is None:
+            self.yolo_wait_start = now
+            self.get_logger().info('[Scan] Camera settled – waiting for YOLO...')
 
-        # Angular steering — same direction
-        twist.angular.z = -ANGULAR_SPEED * (error / 0.5)
+        yolo_elapsed = now - self.yolo_wait_start
 
-        # Linear — camera faces BACK so move BACKWARD to follow
-        dist = self.cat_dist if self.cat_dist is not None else self.front_distance
-
-        if dist < FOLLOW_DIST_MIN:
-            # Too close — move FORWARD (away from cat)
-            twist.linear.x = 0.10
+        if self.last_identity and self.target_cat in self.last_identity:
             self.get_logger().info(
-                f'Too close ({dist:.2f}m) — moving forward',
-                throttle_duration_sec=1.0)
+                f'[Scan] TARGET FOUND: {self.last_identity}')
+            self._enter_found()
+            return
 
-        elif dist > FOLLOW_DIST_MAX:
-            # Too far — move BACKWARD (toward cat)
-            speed = min(FOLLOW_SPEED_MAX,
-                        FOLLOW_SPEED_MAX * (dist - FOLLOW_DIST_TARGET) / 0.3)
-            twist.linear.x = -speed if abs(error) < CENTER_THRESH else 0.0
+        if yolo_elapsed >= YOLO_WAIT_TIMEOUT:
             self.get_logger().info(
-                f'Following backward ({dist:.2f}m)',
-                throttle_duration_sec=1.0)
+                f'[Scan] Object {self.obj_index+1}: '
+                f'not target (got: {self.last_identity or "none"}) – next object')
+            self.obj_index += 1
+            if self.obj_index < len(self.moving_objects):
+                self._start_turn_to_object(self.obj_index)
+            else:
+                self.get_logger().info('[Scan] All objects checked – going to waypoints')
+                self._enter_navigate()
 
-        elif FOLLOW_DIST_MIN <= dist <= FOLLOW_DIST_TARGET:
-            # In sweet spot — slow backward approach
-            twist.linear.x = -0.05 if abs(error) < CENTER_THRESH else 0.0
+    # ══════════════════════════════════════════════════════════════════════════
+    # State: NAVIGATE
+    # ══════════════════════════════════════════════════════════════════════════
 
-        else:
-            twist.linear.x = 0.0
+    def _enter_navigate(self):
+        self.state       = NAVIGATE
+        self.nav_sent    = False
+        self.nav_retries = 0
 
-        self.cmd_pub.publish(twist)
+    def _loop_navigate(self):
+        name, x, y = WAYPOINTS[self.waypoint_index]
 
-    # ── nav goal ──────────────────────────────────────────────────────────────
+        # Check for moving objects first (interrupt navigation)
+        if self.moving_objects and not self.nav_sent:
+            self.get_logger().info('[Nav] Moving objects detected – pausing nav to inspect')
+            self._cancel_nav_goal()
+            self._enter_scan()
+            return
 
-    def _send_nav_goal(self, x, y):
-        if not self.nav_client.server_is_ready():
-            self.get_logger().warn('Nav2 not ready, skipping waypoint.')
+        # Send the goal if not yet sent
+        if not self.nav_sent:
+            self.get_logger().info(
+                f'[Search] Heading to {name} ({x}, {y}) '
+                f'[cycle {self.search_cycle+1}/{MAX_SEARCH_CYCLES}]')
+            self._send_nav_goal(x, y, name)
+            return
+
+        # Goal timed out?
+        if time.time() - self.nav_send_time > NAV_GOAL_TIMEOUT:
+            self.get_logger().warn(f'[Nav] Goal to {name} timed out – treating as failed')
+            self._handle_nav_failure(name, x, y)
+            return
+
+        # Poll goal status
+        if self.nav_goal_handle is None:
+            return   # still waiting for handle
+
+        status = self.nav_goal_handle.status
+        # GoalStatus: 4=SUCCEEDED, 5=CANCELED, 6=ABORTED
+        if status == 4:  # SUCCEEDED
+            self.get_logger().info(f'[Nav] Arrived at {name}')
+            self._enter_spin_at_wp()
+        elif status in (5, 6):
+            self.get_logger().warn(f'[Nav] Goal failed status={status} for {name}')
+            self._handle_nav_failure(name, x, y)
+
+    def _handle_nav_failure(self, name, x, y):
+        self.nav_retries += 1
+        if self.nav_retries <= MAX_NAV_RETRIES:
+            self.get_logger().info(
+                f'[Nav] Retrying {name} (attempt {self.nav_retries}/{MAX_NAV_RETRIES})')
             self.nav_sent = False
+        else:
+            self.get_logger().warn(
+                f'[Nav] Giving up on {name} after {MAX_NAV_RETRIES} retries – skipping')
+            self._advance_waypoint()
+
+    def _send_nav_goal(self, x, y, name):
+        if not self.nav_client.server_is_ready():
+            self.get_logger().warn('[Nav] Nav2 not ready – waiting...')
             return
 
         goal = NavigateToPose.Goal()
@@ -560,114 +384,142 @@ class SeekCat(Node):
         goal.pose.pose.position.y    = y
         goal.pose.pose.orientation.w = 1.0
 
-        self.nav_arrived  = False  # reset arrival flag
         future = self.nav_client.send_goal_async(goal)
-        future.add_done_callback(self._nav_goal_accepted_cb)        
-        self.get_logger().info(f'[Nav2] Goal sent: ({x}, {y})')
+        future.add_done_callback(self._goal_response_cb)
 
-    def _nav_goal_accepted_cb(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn('Nav2 goal rejected!')
+        self.nav_sent      = True
+        self.nav_send_time = time.time()
+        self.nav_goal_handle = None
+        self.get_logger().info(f'[Nav] Goal sent: ({x}, {y})')
+
+    def _goal_response_cb(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().warn('[Nav] Goal rejected!')
             self.nav_sent = False
             return
-        self.get_logger().info('[Nav2] Goal accepted, navigating...')
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._nav_result_cb)
+        self.nav_goal_handle = handle
+        self.get_logger().info('[Nav] Goal accepted, navigating...')
 
-    def _nav_result_cb(self, future):
-        status = future.result().status
-        if status == 4:  # SUCCEEDED
-            self.get_logger().info('[Nav2] ✅ Arrived at waypoint!')
-            self.nav_arrived = True
+    def _cancel_nav_goal(self):
+        if self.nav_goal_handle is not None:
+            self.nav_goal_handle.cancel_goal_async()
+            self.nav_goal_handle = None
+        self.nav_sent = False
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # State: SPIN_AT_WP
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _enter_spin_at_wp(self):
+        self.state               = SPIN_AT_WP
+        self.spin_start          = time.time()
+        self.camera_settle_start = time.time()  # flush frames from navigation
+        self.last_identity       = None          # discard anything queued in transit
+        name = WAYPOINTS[self.waypoint_index][0]
+        self.get_logger().info(
+            f'[Spin] Arrived at {name} – settling {CAMERA_SETTLE_DELAY}s then spinning...')
+
+    def _loop_spin_at_wp(self):
+        now     = time.time()
+        elapsed = now - self.spin_start
+
+        # Settle window: robot is still, flush stale camera frames
+        if now - self.camera_settle_start < CAMERA_SETTLE_DELAY:
+            self.last_identity = None  # keep discarding until pipeline catches up
+            return                     # don't spin yet
+
+        # Check if the target was identified while spinning
+        if self.last_identity and self.target_cat in self.last_identity:
+            self.get_logger().info('[Spin] TARGET FOUND while spinning!')
+            self._enter_found()
+            return
+
+        # Spin for SPIN_DURATION (elapsed counts from arrival, settle included)
+        if elapsed < SPIN_DURATION + CAMERA_SETTLE_DELAY:
+            twist = Twist()
+            twist.angular.z = ANGULAR_SPEED
+            self.cmd_pub.publish(twist)
         else:
-            self.get_logger().warn(f'[Nav2] Goal failed status={status}, retrying...')
-            self.nav_sent = False
+            self._stop_motors()
+            self._advance_waypoint()
 
-    # ── camera trigger ────────────────────────────────────────────────────────
+    def _advance_waypoint(self):
+        self.waypoint_index += 1
+        if self.waypoint_index >= len(WAYPOINTS):
+            self.waypoint_index = 0
+            self.search_cycle  += 1
+            self.get_logger().info(
+                f'[Search] Completed cycle {self.search_cycle}/{MAX_SEARCH_CYCLES}')
 
-    def _trigger_camera(self):
-        msg = String()
-        msg.data = self.target_cat or 'any'
-        self.camera_trigger_pub.publish(msg)
+        if self.search_cycle >= MAX_SEARCH_CYCLES:
+            self.get_logger().warn('[Search] Max cycles reached – sending stop')
+            self._enter_done()
+        else:
+            self._enter_navigate()
 
-    # ── stop ──────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # State transitions: FOUND / DONE
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _send_stop(self):
-        """Send stop command and return robot to home (0,0)."""
-        self.get_logger().info('[Seek] Sending STOP — returning to home (0,0).')
-        self.target_pub.publish(String(data='stop'))
-        self._publish_status('returning home')
-        self._return_home()
+    def _enter_found(self):
+        self.state = FOUND
+        self._cancel_nav_goal()
+        self._stop_motors()
+        self.status_pub.publish(String(data='found'))
+        self.get_logger().info(
+            f'[FOUND] Target "{self.target_cat}" confirmed – all motion stopped.')
 
-    def _return_home(self):
-        """Navigate back to origin (0,0)."""
-        if not self.nav_client.server_is_ready():
-            self.get_logger().warn('Nav2 not ready — cannot return home.')
-            self._stop_all()
-            return
+    def _enter_done(self):
+        self.state = DONE
+        self._cancel_nav_goal()
+        self._stop_motors()
+        self.status_pub.publish(String(data='stop'))
+        self.get_logger().info('[DONE] No target found after max cycles.')
 
-        goal = NavigateToPose.Goal()
-        goal.pose.header.frame_id    = 'map'
-        goal.pose.header.stamp       = self.get_clock().now().to_msg()
-        goal.pose.pose.position.x    = 0.0
-        goal.pose.pose.position.y    = 0.0
-        goal.pose.pose.orientation.w = 1.0
+    # ══════════════════════════════════════════════════════════════════════════
+    # Utility
+    # ══════════════════════════════════════════════════════════════════════════
 
-        self.get_logger().info('[Nav2] Returning to home (0.0, 0.0)...')
-
-        future = self.nav_client.send_goal_async(goal)
-        future.add_done_callback(self._home_goal_cb)
-
-    def _home_goal_cb(self, future):
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().warn('Home goal rejected!')
-            self._stop_all()
-            return
-
-        self.get_logger().info('Heading home...')
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._home_result_cb)
-
-    def _home_result_cb(self, future):
-        self.get_logger().info('✅ Arrived home (0,0)!')
-        self._publish_status('home')
-        self._stop_all()
-
-    def _stop_all(self):
-        self.target_cat = None
-        self.active     = False
-        self.following  = False
-        self.state      = self.STATE_IDLE
-        self.stop_robot()
-        self.get_logger().info('Seek stopped.')
-        self._publish_status('stopped')
-
-    def stop_robot(self):
+    def _stop_motors(self):
         self.cmd_pub.publish(Twist())
 
-    def _publish_status(self, status: str):
-        self.status_pub.publish(String(data=status))
+    def _reset(self):
+        self._cancel_nav_goal()
+        self._stop_motors()
+        self.state          = IDLE
+        self.active         = False
+        self.target_cat     = None
+        self.waypoint_index = 0
+        self.search_cycle   = 0
+        self.moving_objects = []
+        self.last_identity  = None
 
-    # ── clustering ────────────────────────────────────────────────────────────
-
-    def _cluster_points(self, points, gap=0.3):
+    def _cluster(self, points):
+        """Simple distance-based clustering → returns list of (centroid_angle, centroid_dist)."""
         if not points:
             return []
         clusters = []
-        current  = [points[0]]
-        for pt in points[1:]:
-            if min(euclidean(pt, cp) for cp in current) <= gap:
-                current.append(pt)
-            else:
-                clusters.append(current)
-                current = [pt]
-        clusters.append(current)
+        used     = [False] * len(points)
+        for i, (a0, r0) in enumerate(points):
+            if used[i]:
+                continue
+            group = [(a0, r0)]
+            used[i] = True
+            x0, y0 = polar_to_xy(r0, a0)
+            for j, (a1, r1) in enumerate(points):
+                if used[j]:
+                    continue
+                x1, y1 = polar_to_xy(r1, a1)
+                if math.hypot(x1 - x0, y1 - y0) < 0.25:
+                    group.append((a1, r1))
+                    used[j] = True
+            if len(group) >= CLUSTER_MIN_POINTS:
+                ca = sum(a for a, _ in group) / len(group)
+                cr = sum(r for _, r in group) / len(group)
+                clusters.append((ca, cr))
         return clusters
 
-
-# ── main ──────────────────────────────────────────────────────────────────────
 
 def main(args=None):
     rclpy.init(args=args)
@@ -677,9 +529,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.stop_robot()
+        node.stop_robot() if hasattr(node, 'stop_robot') else node._stop_motors()
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
