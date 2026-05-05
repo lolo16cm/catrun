@@ -31,6 +31,7 @@ from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+from geometry_msgs.msg import PointStamped, Twist
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 ANGULAR_SPEED        = 0.4     # rad/s for camera-turn and waypoint spin
@@ -54,6 +55,12 @@ NAV_GOAL_TIMEOUT     = 25.0    # seconds before declaring a nav goal timed-out
 # Search cycles
 MAX_SEARCH_CYCLES    = 3
 
+# Follow behavior
+FOLLOW_DIST_TARGET = 0.30   # 1 foot in metres
+FOLLOW_TOLERANCE   = 0.05   # dead zone
+FOLLOW_SPEED_MAX   = 0.20   # m/s max backward speed
+IMG_WIDTH          = 640    # camera resolution width
+
 KNOWN_CATS = {'eevee', 'raichu', 'pichu'}
 
 WAYPOINTS = [
@@ -69,6 +76,7 @@ NAVIGATE     = 'NAVIGATE'
 SPIN_AT_WP   = 'SPIN_AT_WP'
 FOUND        = 'FOUND'
 DONE         = 'DONE'
+FOLLOW       = 'FOLLOW'
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def polar_to_xy(r, angle_rad):
@@ -114,6 +122,12 @@ class SeekCat(Node):
         self._prev_ranges    = None
         self._prev_scan_time = None
 
+        # Init follow state variables
+        self.cat_cx       = None
+        self.cat_dist     = None
+        self.last_seen    = None
+        self.front_distance = float('inf')
+
         # ── Nav2 action client ────────────────────────────────────────────────
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -121,6 +135,10 @@ class SeekCat(Node):
         self.create_subscription(String,    '/cat_target',   self._cb_target,   10)
         self.create_subscription(String,    '/cat_identity', self._cb_identity, 10)
         self.create_subscription(LaserScan, '/scan',         self._cb_scan,     10)
+        # Cat position from camera (normalised cx)
+        from geometry_msgs.msg import PointStamped
+        self.create_subscription(
+            PointStamped, '/cat_position', self._cb_position, 10)
 
         # ── publications ──────────────────────────────────────────────────────
         self.cmd_pub    = self.create_publisher(Twist, '/cmd_vel',     10)
@@ -151,6 +169,17 @@ class SeekCat(Node):
     def _cb_identity(self, msg: String):
         """YOLO result from cat_detector – used during SCAN_OBJECTS."""
         self.last_identity = msg.data.strip().lower()
+
+    def _cb_position(self, msg):
+        """Normalised [0,1] cat position from cat_detector."""
+        self.cat_cx    = msg.point.x
+        self.cat_dist  = msg.point.z if msg.point.z > 0 else None
+        self.last_seen = self.get_clock().now()
+        # If we're searching and cat found → switch to follow
+        if self.state in (SCAN_OBJECTS, NAVIGATE, SPIN_AT_WP):
+            self.get_logger().info(
+                f'[Position] Cat detected at cx={self.cat_cx:.2f} — switching to follow!')
+            self._enter_found()
 
     def _cb_scan(self, msg: LaserScan):
         """Detect moving objects by comparing consecutive scans."""
@@ -191,6 +220,14 @@ class SeekCat(Node):
         if clusters:
             self.moving_objects = clusters   # update continuously
 
+        # Track closest front obstacle for follow distance
+        n = len(msg.ranges)
+        front_idx = list(range(0, n//12)) + list(range(11*n//12, n))
+        front_vals = [msg.ranges[i] for i in front_idx
+                    if msg.range_min < msg.ranges[i] < msg.range_max
+                    and not math.isinf(msg.ranges[i])]
+        self.front_distance = min(front_vals) if front_vals else float('inf')
+
     # ══════════════════════════════════════════════════════════════════════════
     # Main control loop
     # ══════════════════════════════════════════════════════════════════════════
@@ -198,23 +235,19 @@ class SeekCat(Node):
     def _loop(self):
         if self.state == IDLE or self.state == DONE:
             return
-
-        # ── FOUND: stop everything ────────────────────────────────────────────
         if self.state == FOUND:
             self._stop_motors()
             return
-
-        # ── SCAN_OBJECTS ──────────────────────────────────────────────────────
+        # ── NEW: FOLLOW ───────────────────────────────────────────────────────
+        if self.state == FOLLOW:
+            self._loop_follow()
+            return
         if self.state == SCAN_OBJECTS:
             self._loop_scan_objects()
             return
-
-        # ── NAVIGATE ─────────────────────────────────────────────────────────
         if self.state == NAVIGATE:
             self._loop_navigate()
             return
-
-        # ── SPIN_AT_WP ────────────────────────────────────────────────────────
         if self.state == SPIN_AT_WP:
             self._loop_spin_at_wp()
             return
@@ -463,12 +496,70 @@ class SeekCat(Node):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _enter_found(self):
-        self.state = FOUND
+        self.state = FOLLOW
         self._cancel_nav_goal()
         self._stop_motors()
-        self.status_pub.publish(String(data='found'))
+        self.cat_cx       = None
+        self.cat_dist     = None
+        self.last_seen    = self.get_clock().now()
+        self.status_pub.publish(String(data='following'))
         self.get_logger().info(
-            f'[FOUND] Target "{self.target_cat}" confirmed – all motion stopped.')
+            f'[FOLLOW] Target "{self.target_cat}" confirmed – following at 1 foot.')
+
+    def _loop_follow(self):
+        """
+        Follow cat at ~1 foot using ball_follower proportional control.
+        Camera faces BACK → move backward to follow.
+        """
+        now = self.get_clock().now()
+
+        # Check if cat still visible
+        if self.last_seen is not None:
+            elapsed = (now - self.last_seen).nanoseconds / 1e9
+            if elapsed > 5.0:
+                self.get_logger().info('[FOLLOW] Cat lost — resuming search.')
+                self.state          = SCAN_OBJECTS
+                self.moving_objects = []
+                self._enter_scan()
+                return
+
+        if self.cat_cx is None:
+            self._stop_motors()
+            return
+
+        twist = Twist()
+
+        # ── Angular: proportional steering (same as ball_follower) ────────────
+        ball_col        = self.cat_cx * IMG_WIDTH
+        error           = ball_col - IMG_WIDTH / 2.0
+        twist.angular.z = -error / 300.0
+
+        # ── Linear: maintain 1 foot distance, move BACKWARD ───────────────────
+        dist = self.cat_dist if (
+            hasattr(self, 'cat_dist') and self.cat_dist is not None
+        ) else getattr(self, 'front_distance', None)
+
+        if dist is not None and not math.isinf(dist):
+            dist_error = dist - FOLLOW_DIST_TARGET
+
+            if dist_error > FOLLOW_TOLERANCE:
+                # Too far → backward toward cat
+                twist.linear.x = -min(FOLLOW_SPEED_MAX, dist_error * 0.4)
+            elif dist_error < -FOLLOW_TOLERANCE:
+                # Too close → forward away from cat
+                twist.linear.x = max(0.10, abs(dist_error) * 0.4)
+            else:
+                twist.linear.x = 0.0
+
+            self.get_logger().info(
+                f'[FOLLOW] dist={dist:.2f}m err={dist_error:.2f}m '
+                f'cx={self.cat_cx:.2f} lin={twist.linear.x:.2f} '
+                f'ang={twist.angular.z:.2f}',
+                throttle_duration_sec=0.5)
+        else:
+            twist.linear.x = 0.0
+
+        self.cmd_pub.publish(twist)
 
     def _enter_done(self):
         self.state = DONE
