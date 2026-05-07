@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""
+seek_cat.py  –  LiDAR-guided sweep
+=====================================
+State machine:
+  IDLE        → waiting for /cat_target
+  SWEEP       → rotate to each open corridor found by LiDAR, check YOLO
+  NAVIGATE    → drive to next waypoint through open space
+  FOLLOW      → cat found → follow at 1 foot with back camera
+  AVOID       → obstacle too close → turn to open space
+  DONE        → 3 full cycles with no result → stop + return home
+
+Key improvements:
+- LiDAR finds open corridors → only turns camera toward open directions
+- Obstacle avoidance built into navigation
+- No random spinning into walls
+- Moving object detection still triggers camera check
+"""
+
+import math
+import time
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import Twist, PointStamped
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
+
+# ── tunables ──────────────────────────────────────────────────────────────────
+
+# Follow
+FOLLOW_DIST_TARGET  = 0.30    # 1 foot
+FOLLOW_TOLERANCE    = 0.05
+FOLLOW_SPEED_MAX    = 0.20
+IMG_WIDTH           = 640
+CAT_LOST_TIMEOUT    = 4.0
+
+# LiDAR sweep
+ANGULAR_SPEED       = 0.3     # rad/s — slow enough for camera
+CAMERA_HFOV_DEG     = 63.0    # IMX477 FOV
+CAMERA_HFOV_RAD     = math.radians(CAMERA_HFOV_DEG)
+SWEEP_PAUSE_SEC     = 2.0     # pause at each sweep stop for YOLO
+SWEEP_TURN_SEC      = CAMERA_HFOV_RAD / ANGULAR_SPEED  # time per stop
+
+# Obstacle avoidance
+SAFE_DISTANCE       = 0.35    # m — stop if closer than this
+AVOID_DISTANCE      = 0.50    # m — start avoiding if closer than this
+OPEN_CORRIDOR_MIN   = 0.60    # m — minimum clear distance to be "open"
+
+# LiDAR motion detection
+MOTION_DIST_THRESH  = 0.15
+CLUSTER_MIN_POINTS  = 3
+CAT_DIST_MAX        = 3.0
+
+# Nav2
+MAX_NAV_RETRIES     = 2
+NAV_GOAL_TIMEOUT    = 30.0
+
+# Search
+MAX_SEARCH_CYCLES   = 3
+
+KNOWN_CATS = {'eevee', 'raichu', 'pichu'}
+
+WAYPOINTS = [
+    ('L1',  -0.91,  0.33),
+    ('L2', 2.87,    1.057),
+    ('L3',  1.396, 1.127),
+    ('L4',  1.1,  -1.037),
+    ('L5',  -0.178,  -1.31),
+    ('Home', 0.0,   0.0),
+]
+
+# ── states ────────────────────────────────────────────────────────────────────
+IDLE     = 'IDLE'
+SWEEP    = 'SWEEP'
+NAVIGATE = 'NAVIGATE'
+FOLLOW   = 'FOLLOW'
+AVOID    = 'AVOID'
+DONE     = 'DONE'
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def polar_to_xy(r, angle_rad):
+    return r * math.cos(angle_rad), r * math.sin(angle_rad)
+
+def normalize_angle(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+class SeekCat(Node):
+
+    def __init__(self):
+        super().__init__('seek_cat')
+
+        # ── core state ────────────────────────────────────────────────────────
+        self.state      = IDLE
+        self.target_cat = None
+        self.active     = False
+
+        # LiDAR data
+        self.scan_ranges     = []
+        self.scan_angle_min  = 0.0
+        self.scan_angle_inc  = 0.0
+        self.front_distance  = float('inf')
+        self.left_distance   = float('inf')
+        self.right_distance  = float('inf')
+        self.open_corridors  = []   # list of angles (rad) with clear space
+        self.moving_objects  = []   # list of (angle, dist)
+        self._prev_ranges    = None
+        self._prev_scan_time = None
+
+        # Sweep state
+        self.sweep_corridors      = []   # open corridors to check
+        self.sweep_index          = 0    # current corridor index
+        self.sweep_phase          = None # 'turning' | 'pausing'
+        self.sweep_phase_start    = None
+        self.sweep_turn_dir       = 1    # +1 CCW, -1 CW
+        self.yolo_result          = None
+        self.last_identity        = None
+
+        # Navigate state
+        self.waypoint_index  = 0
+        self.search_cycle    = 0
+        self.nav_sent        = False
+        self.nav_send_time   = None
+        self.nav_goal_handle = None
+        self.nav_retries     = 0
+
+        # Avoid state
+        self.avoid_start     = None
+        self.pre_avoid_state = NAVIGATE
+
+        # Follow state
+        self.cat_cx         = None
+        self.cat_dist       = None
+        self.last_seen      = None
+        self.last_known_x   = None
+        self.last_known_y   = None
+
+        # Nav2
+        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # ── subscriptions ─────────────────────────────────────────────────────
+        self.create_subscription(String,       '/cat_target',   self._cb_target,   10)
+        self.create_subscription(String,       '/cat_identity', self._cb_identity, 10)
+        self.create_subscription(PointStamped, '/cat_position', self._cb_position, 10)
+        self.create_subscription(LaserScan,    '/scan',         self._cb_scan,     10)
+
+        # ── publishers ────────────────────────────────────────────────────────
+        self.cmd_pub    = self.create_publisher(Twist,  '/cmd_vel',     10)
+        self.status_pub = self.create_publisher(String, '/seek_status', 10)
+        self.target_pub = self.create_publisher(String, '/cat_target',  10)
+
+        self.create_timer(0.1, self._loop)
+        self.get_logger().info('SeekCat ready – LiDAR-guided sweep mode')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Callbacks
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _cb_target(self, msg: String):
+        text = msg.data.strip().lower()
+        if text in ('', 'stop', 'none'):
+            self._reset()
+            return
+        if text in KNOWN_CATS:
+            self.target_cat   = text
+            self.active       = True
+            self.search_cycle = 0
+            self.waypoint_index = 0
+            if self.state == IDLE:
+                self._enter_sweep()
+            self.get_logger().info(f'[Target] Seeking: {self.target_cat}')
+
+    def _cb_identity(self, msg: String):
+        name = msg.data.strip().lower()
+        self.last_identity = name
+        self.yolo_result   = name
+        if self.target_cat and name == self.target_cat:
+            if self.state in (SWEEP, NAVIGATE):
+                self.get_logger().info(f'[Identity] {name} confirmed!')
+                self._enter_follow()
+
+    def _cb_position(self, msg: PointStamped):
+        self.cat_cx   = msg.point.x
+        self.cat_dist = msg.point.z if msg.point.z > 0 else None
+        self.last_seen = self.get_clock().now()
+        if self.state in (SWEEP, NAVIGATE, AVOID):
+            self.get_logger().info(
+                f'[Position] Cat at cx={self.cat_cx:.2f} — following!')
+            self._enter_follow()
+
+    def _cb_scan(self, msg: LaserScan):
+        now    = time.time()
+        ranges = list(msg.ranges)
+        n      = len(ranges)
+
+        self.scan_ranges    = ranges
+        self.scan_angle_min = msg.angle_min
+        self.scan_angle_inc = msg.angle_increment
+
+        def safe_min(indices):
+            vals = [ranges[i] for i in indices
+                    if msg.range_min < ranges[i] < msg.range_max
+                    and math.isfinite(ranges[i])]
+            return min(vals) if vals else float('inf')
+
+        # Sector distances
+        front_idx = list(range(0, n//12)) + list(range(11*n//12, n))
+        left_idx  = list(range(n//6,  n//3))
+        right_idx = list(range(2*n//3, 5*n//6))
+
+        self.front_distance = safe_min(front_idx)
+        self.left_distance  = safe_min(left_idx)
+        self.right_distance = safe_min(right_idx)
+
+        # ── Find open corridors ───────────────────────────────────────────────
+        # Divide 360° into camera FOV sized sectors
+        num_sectors = int(math.ceil(2 * math.pi / CAMERA_HFOV_RAD))
+        corridors   = []
+
+        for s in range(num_sectors):
+            sector_angle = msg.angle_min + s * CAMERA_HFOV_RAD
+            # Get all rays in this sector
+            i_start = int((sector_angle - msg.angle_min) / msg.angle_increment)
+            i_end   = int(i_start + CAMERA_HFOV_RAD / msg.angle_increment)
+            i_start = max(0, i_start)
+            i_end   = min(n-1, i_end)
+
+            sector_ranges = [ranges[i] for i in range(i_start, i_end+1)
+                             if msg.range_min < ranges[i] < msg.range_max
+                             and math.isfinite(ranges[i])]
+
+            if not sector_ranges:
+                continue
+
+            avg_dist = sum(sector_ranges) / len(sector_ranges)
+            min_dist = min(sector_ranges)
+
+            # Open corridor = average clear distance AND minimum safe
+            if avg_dist > OPEN_CORRIDOR_MIN and min_dist > SAFE_DISTANCE:
+                center_angle = sector_angle + CAMERA_HFOV_RAD / 2
+                corridors.append((center_angle, avg_dist))
+
+        self.open_corridors = corridors
+
+        # ── Motion detection ──────────────────────────────────────────────────
+        if self._prev_ranges is None or len(self._prev_ranges) != n:
+            self._prev_ranges    = ranges
+            self._prev_scan_time = now
+            return
+
+        dt = now - (self._prev_scan_time or 0)
+        if dt < 0.1:
+            return
+
+        moving = []
+        for i, (r_new, r_old) in enumerate(zip(ranges, self._prev_ranges)):
+            if not math.isfinite(r_new) or not math.isfinite(r_old):
+                continue
+            if r_new > CAT_DIST_MAX:
+                continue
+            if abs(r_new - r_old) > MOTION_DIST_THRESH:
+                angle = msg.angle_min + i * msg.angle_increment
+                moving.append((angle, r_new))
+
+        self._prev_ranges    = ranges
+        self._prev_scan_time = now
+
+        if self.active:
+            clusters = self._cluster(moving)
+            if clusters:
+                self.moving_objects = clusters
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Main loop
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _loop(self):
+        if self.state in (IDLE, DONE):
+            return
+
+        # ── Obstacle check — highest priority ─────────────────────────────────
+        if self.state != AVOID and self.state != FOLLOW:
+            if self.front_distance < SAFE_DISTANCE:
+                self.get_logger().warn(
+                    f'[Avoid] Obstacle at {self.front_distance:.2f}m — avoiding!')
+                self._enter_avoid()
+                return
+
+        if self.state == SWEEP:
+            self._loop_sweep()
+        elif self.state == NAVIGATE:
+            self._loop_navigate()
+        elif self.state == FOLLOW:
+            self._loop_follow()
+        elif self.state == AVOID:
+            self._loop_avoid()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # State: SWEEP
+    # LiDAR finds open corridors → turn camera toward each one → check YOLO
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _enter_sweep(self):
+        self.state         = SWEEP
+        self.sweep_index   = 0
+        self.sweep_phase   = None
+        self.yolo_result   = None
+        self.last_identity = None
+
+        # Use open corridors from LiDAR, fall back to all directions if none
+        if self.open_corridors:
+            self.sweep_corridors = [a for a, d in self.open_corridors]
+            self.get_logger().info(
+                f'[Sweep] {len(self.sweep_corridors)} open corridors found')
+        else:
+            # No open corridors — sweep all directions in FOV steps
+            num = int(math.ceil(2 * math.pi / CAMERA_HFOV_RAD))
+            self.sweep_corridors = [
+                i * CAMERA_HFOV_RAD for i in range(num)]
+            self.get_logger().info(
+                f'[Sweep] No open corridors — full 360° sweep ({num} stops)')
+
+        self.status_pub.publish(
+            String(data=f'sweeping for {self.target_cat}'))
+        self._start_sweep_stop(0)
+
+    def _start_sweep_stop(self, idx):
+        """Start turning toward sweep stop idx."""
+        if idx >= len(self.sweep_corridors):
+            # All corridors checked — go to next waypoint
+            self.get_logger().info(
+                '[Sweep] All corridors checked — navigating to waypoint')
+            self._enter_navigate()
+            return
+
+        target_angle = self.sweep_corridors[idx]
+        # Camera at back → add 180°
+        turn_angle   = normalize_angle(target_angle + math.pi)
+
+        self.sweep_index      = idx
+        self.sweep_phase      = 'turning'
+        self.sweep_phase_start = time.time()
+        self.sweep_turn_dir   = 1 if turn_angle >= 0 else -1
+        self.yolo_result      = None
+        self.last_identity    = None
+
+        self.get_logger().info(
+            f'[Sweep] Stop {idx+1}/{len(self.sweep_corridors)} — '
+            f'turning {math.degrees(turn_angle):.0f}° '
+            f'(corridor clear for {self.open_corridors[idx][1]:.2f}m '
+            f'avg)' if idx < len(self.open_corridors) else
+            f'[Sweep] Stop {idx+1}/{len(self.sweep_corridors)}')
+
+    def _loop_sweep(self):
+        now = time.time()
+
+        # ── Turning phase ─────────────────────────────────────────────────────
+        if self.sweep_phase == 'turning':
+            elapsed = now - self.sweep_phase_start
+            if elapsed < SWEEP_TURN_SEC:
+                # Check obstacle before turning
+                if self.front_distance < SAFE_DISTANCE:
+                    self._stop_motors()
+                    return
+                twist = Twist()
+                twist.angular.z = self.sweep_turn_dir * ANGULAR_SPEED
+                self.cmd_pub.publish(twist)
+            else:
+                self._stop_motors()
+                self.sweep_phase       = 'pausing'
+                self.sweep_phase_start = now
+                self.yolo_result       = None
+                self.last_identity     = None
+                self.get_logger().info(
+                    f'[Sweep] Pausing {SWEEP_PAUSE_SEC}s at stop '
+                    f'{self.sweep_index+1}/{len(self.sweep_corridors)}')
+
+        # ── Pausing phase — wait for YOLO ─────────────────────────────────────
+        elif self.sweep_phase == 'pausing':
+            elapsed = now - self.sweep_phase_start
+
+            # Check if moving object appeared — look at it
+            if self.moving_objects and elapsed > 0.5:
+                obj_angle, obj_dist = self.moving_objects[0]
+                # Only check if in open corridor
+                if obj_dist > SAFE_DISTANCE:
+                    self.get_logger().info(
+                        f'[Sweep] Moving object at {math.degrees(obj_angle):.0f}° '
+                        f'dist={obj_dist:.2f}m — checking!')
+                    self.moving_objects = []
+                    # Insert moving object angle at front of sweep
+                    self.sweep_corridors.insert(
+                        self.sweep_index + 1, obj_angle)
+
+            # YOLO found target
+            if (self.yolo_result == self.target_cat or
+                    (self.last_identity and
+                     self.target_cat in self.last_identity)):
+                self.get_logger().info(
+                    f'[Sweep] ✅ Found {self.target_cat}!')
+                self._enter_follow()
+                return
+
+            # Pause done — next corridor
+            if elapsed >= SWEEP_PAUSE_SEC:
+                self._start_sweep_stop(self.sweep_index + 1)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # State: NAVIGATE
+    # Drive to waypoints through open space only
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _enter_navigate(self):
+        self.state       = NAVIGATE
+        self.nav_sent    = False
+        self.nav_retries = 0
+        self.nav_goal_handle = None
+
+    def _loop_navigate(self):
+        name, x, y = WAYPOINTS[self.waypoint_index]
+
+        if not self.nav_sent:
+            self.get_logger().info(
+                f'[Nav] → {name} ({x:.2f}, {y:.2f}) '
+                f'[cycle {self.search_cycle+1}/{MAX_SEARCH_CYCLES}]')
+            self._send_nav_goal(x, y, name)
+            return
+
+        # Timeout
+        if time.time() - self.nav_send_time > NAV_GOAL_TIMEOUT:
+            self.get_logger().warn(f'[Nav] Timeout to {name}')
+            self._handle_nav_failure(name, x, y)
+            return
+
+        if self.nav_goal_handle is None:
+            return
+
+        status = self.nav_goal_handle.status
+        if status == 4:  # SUCCEEDED
+            self.get_logger().info(f'[Nav] ✅ Arrived at {name}')
+            # Sweep at this waypoint
+            self._enter_sweep()
+        elif status in (5, 6):
+            self._handle_nav_failure(name, x, y)
+
+    def _handle_nav_failure(self, name, x, y):
+        self.nav_retries += 1
+        if self.nav_retries <= MAX_NAV_RETRIES:
+            self.get_logger().warn(
+                f'[Nav] Retry {self.nav_retries}/{MAX_NAV_RETRIES} for {name}')
+            self.nav_sent = False
+        else:
+            self.get_logger().warn(f'[Nav] Skipping {name}')
+            self._advance_waypoint()
+
+    def _advance_waypoint(self):
+        self.waypoint_index += 1
+        self.nav_sent        = False
+        self.nav_retries     = 0
+        self.nav_goal_handle = None
+
+        if self.waypoint_index >= len(WAYPOINTS):
+            self.waypoint_index = 0
+            self.search_cycle  += 1
+            self.get_logger().info(
+                f'[Search] Cycle {self.search_cycle}/{MAX_SEARCH_CYCLES}')
+            if self.search_cycle >= MAX_SEARCH_CYCLES:
+                self._enter_done()
+                return
+
+        self._enter_navigate()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # State: AVOID
+    # Turn toward the most open direction when obstacle detected
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _enter_avoid(self):
+        self.pre_avoid_state = self.state
+        self.state           = AVOID
+        self.avoid_start     = time.time()
+        self._cancel_nav_goal()
+        self._stop_motors()
+        self.get_logger().info(
+            f'[Avoid] front={self.front_distance:.2f}m '
+            f'left={self.left_distance:.2f}m '
+            f'right={self.right_distance:.2f}m')
+
+    def _loop_avoid(self):
+        elapsed = time.time() - self.avoid_start
+
+        # Front is clear — resume
+        if self.front_distance > AVOID_DISTANCE:
+            self.get_logger().info('[Avoid] Path clear — resuming')
+            if self.pre_avoid_state == FOLLOW:
+                self.state = FOLLOW
+            else:
+                self._enter_sweep()
+            return
+
+        # Turn toward most open side
+        twist = Twist()
+        if self.open_corridors:
+            # Turn toward best open corridor
+            best_angle = self.open_corridors[0][0]
+            twist.angular.z = ANGULAR_SPEED if best_angle > 0 else -ANGULAR_SPEED
+        elif self.right_distance > self.left_distance:
+            twist.angular.z = -ANGULAR_SPEED  # turn right
+        else:
+            twist.angular.z = ANGULAR_SPEED   # turn left
+
+        self.cmd_pub.publish(twist)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # State: FOLLOW
+    # Follow cat at 1 foot, camera faces back → move backward
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _enter_follow(self):
+        self.state = FOLLOW
+        self._cancel_nav_goal()
+        self._stop_motors()
+        self.status_pub.publish(
+            String(data=f'following {self.target_cat}'))
+        self.get_logger().info(
+            f'[Follow] Tracking {self.target_cat} at 1 foot')
+
+    def _loop_follow(self):
+        now = self.get_clock().now()
+
+        # Check if cat still visible
+        if self.last_seen is not None:
+            elapsed = (now - self.last_seen).nanoseconds / 1e9
+            if elapsed > CAT_LOST_TIMEOUT:
+                self.get_logger().info(
+                    f'[Follow] Cat lost — sweeping from last position')
+                self.cat_cx = None
+                self.waypoint_index = 0
+                self._enter_sweep()
+                return
+
+        if self.cat_cx is None:
+            self._stop_motors()
+            return
+
+        # Obstacle check while following
+        if self.front_distance < SAFE_DISTANCE:
+            self._stop_motors()
+            self.get_logger().warn(
+                f'[Follow] Obstacle at {self.front_distance:.2f}m — pausing',
+                throttle_duration_sec=1.0)
+            return
+
+        twist = Twist()
+
+        # Angular: proportional steering
+        ball_col        = self.cat_cx * IMG_WIDTH
+        error           = ball_col - IMG_WIDTH / 2.0
+        twist.angular.z = -error / 300.0
+
+        # Linear: maintain 1 foot, move BACKWARD (camera faces back)
+        dist = (self.cat_dist if self.cat_dist is not None
+                else self.front_distance)
+
+        if dist is not None and not math.isinf(dist):
+            dist_error = dist - FOLLOW_DIST_TARGET
+            if dist_error > FOLLOW_TOLERANCE:
+                twist.linear.x = -min(FOLLOW_SPEED_MAX, dist_error * 0.4)
+            elif dist_error < -FOLLOW_TOLERANCE:
+                twist.linear.x = max(0.10, abs(dist_error) * 0.4)
+            else:
+                twist.linear.x = 0.0
+            self.get_logger().info(
+                f'[Follow] dist={dist:.2f}m '
+                f'lin={twist.linear.x:.2f} '
+                f'ang={twist.angular.z:.2f}',
+                throttle_duration_sec=0.5)
+        else:
+            twist.linear.x = 0.0
+
+        self.cmd_pub.publish(twist)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Nav2 helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _send_nav_goal(self, x, y, name):
+        if not self.nav_client.server_is_ready():
+            self.get_logger().warn('[Nav] Nav2 not ready')
+            return
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id    = 'map'
+        goal.pose.header.stamp       = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x    = x
+        goal.pose.pose.position.y    = y
+        goal.pose.pose.orientation.w = 1.0
+
+        future = self.nav_client.send_goal_async(goal)
+        future.add_done_callback(self._goal_response_cb)
+
+        self.nav_sent        = True
+        self.nav_send_time   = time.time()
+        self.nav_goal_handle = None
+
+    def _goal_response_cb(self, future):
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().warn('[Nav] Goal rejected!')
+            self.nav_sent = False
+            return
+        self.nav_goal_handle = handle
+
+    def _cancel_nav_goal(self):
+        if self.nav_goal_handle is not None:
+            self.nav_goal_handle.cancel_goal_async()
+            self.nav_goal_handle = None
+        self.nav_sent = False
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Done + utility
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _enter_done(self):
+        self.state = DONE
+        self._cancel_nav_goal()
+        self._stop_motors()
+        self.target_pub.publish(String(data='stop'))
+        self.status_pub.publish(String(data='stop'))
+        self.get_logger().info('[DONE] Cat not found — returning home')
+        self._return_home()
+
+    def _return_home(self):
+        if not self.nav_client.server_is_ready():
+            return
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id    = 'map'
+        goal.pose.header.stamp       = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x    = 0.0
+        goal.pose.pose.position.y    = 0.0
+        goal.pose.pose.orientation.w = 1.0
+        self.nav_client.send_goal_async(goal)
+        self.get_logger().info('[Nav] Returning home (0, 0)')
+
+    def _stop_motors(self):
+        self.cmd_pub.publish(Twist())
+
+    def _reset(self):
+        self._cancel_nav_goal()
+        self._stop_motors()
+        self.state          = IDLE
+        self.active         = False
+        self.target_cat     = None
+        self.waypoint_index = 0
+        self.search_cycle   = 0
+        self.moving_objects = []
+        self.cat_cx         = None
+        self.last_seen      = None
+
+    def _cluster(self, points):
+        if not points:
+            return []
+        clusters = []
+        used = [False] * len(points)
+        for i, (a0, r0) in enumerate(points):
+            if used[i]:
+                continue
+            group   = [(a0, r0)]
+            used[i] = True
+            x0, y0  = polar_to_xy(r0, a0)
+            for j, (a1, r1) in enumerate(points):
+                if used[j]:
+                    continue
+                x1, y1 = polar_to_xy(r1, a1)
+                if math.hypot(x1-x0, y1-y0) < 0.25:
+                    group.append((a1, r1))
+                    used[j] = True
+            if len(group) >= CLUSTER_MIN_POINTS:
+                ca = sum(a for a, _ in group) / len(group)
+                cr = sum(r for _, r in group) / len(group)
+                clusters.append((ca, cr))
+        return clusters
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SeekCat()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node._stop_motors()
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
