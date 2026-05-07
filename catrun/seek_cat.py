@@ -346,6 +346,18 @@ class SeekCat(Node):
     def _loop_navigate(self):
         label, wx, wy = WAYPOINTS[self.waypoint_index]
 
+        # Rate limit goal sending to once per second
+        if hasattr(self, '_last_goal_time') and \
+                time.time() - self._last_goal_time < 1.0:
+            return
+
+        self._last_goal_time = time.time()
+        self.get_logger().info(
+            f'[Nav] → {label} ({wx:.2f}, {wy:.2f}) '
+            f'[cycle {self.search_cycles+1}/{MAX_SEARCH_CYCLES}]')
+        self._send_nav_goal(wx, wy)
+        return
+        
         if not self.nav_sent:
             self.get_logger().info(
                 f'[Nav] → {label} ({wx:.2f}, {wy:.2f}) '
@@ -371,8 +383,10 @@ class SeekCat(Node):
         self._advance_waypoint()
 
     def _send_nav_goal(self, x, y):
-        if not self.nav_client.server_is_ready():
-            self.get_logger().warn('[Nav] Nav2 not ready')
+        if not self.nav_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn('[Nav] Nav2 not ready — waiting...',
+                                throttle_duration_sec=3.0)
+            self.nav_sent = False
             return
 
         goal = NavigateToPose.Goal()
@@ -389,6 +403,7 @@ class SeekCat(Node):
 
         future = self.nav_client.send_goal_async(goal)
         future.add_done_callback(self._nav_accepted_cb)
+        self.get_logger().info(f'[Nav] Goal sent ({x:.2f}, {y:.2f})')
 
     def _nav_accepted_cb(self, future):
         handle = future.result()
