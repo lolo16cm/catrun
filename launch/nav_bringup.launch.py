@@ -35,8 +35,7 @@ def generate_launch_description():
         # Terminal 4 — rf2o odometry
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                os.path.join(rf2o_dir, 'launch',
-                             'rf2o_laser_odometry.launch.py')
+                os.path.join(rf2o_dir, 'launch', 'rf2o_laser_odometry.launch.py')
             ),
         ),
 
