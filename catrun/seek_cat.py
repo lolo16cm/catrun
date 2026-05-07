@@ -51,6 +51,11 @@ WAYPOINT_SPIN_DURATION = 4.0
 # Max full search cycles before sending stop
 MAX_SEARCH_CYCLES  = 3
 
+# Obstacle avoidance
+SAFE_DISTANCE     = 0.35   # m — stop and turn if closer than this
+AVOID_DISTANCE    = 0.50   # m — slow down if closer than this
+RECOVERY_TURN_SEC = 1.2    # s — how long to turn during recovery
+
 KNOWN_CATS = {'eevee', 'raichu', 'pichu'}
 
 WAYPOINTS = [
@@ -139,6 +144,16 @@ class SeekCat(Node):
         self.front_distance     = float('inf')
         self.last_scan_time     = 0.0
 
+        # Obstacle avoidance
+        self.front_left_distance  = float('inf')
+        self.front_right_distance = float('inf')
+        self.left_distance        = float('inf')
+        self.right_distance       = float('inf')
+        self.is_avoiding          = False
+        self.avoid_start          = None
+        self.avoid_turn_dir       = 1  # +1 left, -1 right
+        self.pre_avoid_state      = None
+
         # Nav2
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
@@ -155,6 +170,7 @@ class SeekCat(Node):
         self.status_pub         = self.create_publisher(String, '/seek_status',          10)
 
         self.create_timer(0.1, self.control_loop)
+        self._current_nav_handle = None
 
         self.get_logger().info(
             f'SeekCat ready. Known: {KNOWN_CATS}. '
@@ -214,11 +230,40 @@ class SeekCat(Node):
         # Update front distance
         ranges = scan.ranges
         n = len(ranges)
-        front_idx = list(range(0, n//12)) + list(range(11*n//12, n))
-        front_vals = [ranges[i] for i in front_idx
-                      if scan.range_min < ranges[i] < scan.range_max
-                      and not math.isinf(ranges[i])]
-        self.front_distance = min(front_vals) if front_vals else float('inf')
+
+        def safe_min(indices):
+            vals = [ranges[i] for i in indices
+                    if scan.range_min < ranges[i] < scan.range_max
+                    and not math.isinf(ranges[i])
+                    and not math.isnan(ranges[i])]
+            return min(vals) if vals else float('inf')
+
+        # Front ±30°
+        front_idx       = list(range(0, n//12)) + list(range(11*n//12, n))
+        # Front-left 30°-90°
+        front_left_idx  = list(range(n//12, n//4))
+        # Front-right 270°-330°
+        front_right_idx = list(range(3*n//4, 11*n//12))
+        # Left 90°-150°
+        left_idx        = list(range(n//4, 5*n//12))
+        # Right 210°-270°
+        right_idx       = list(range(7*n//12, 3*n//4))
+
+        self.front_distance       = safe_min(front_idx)
+        self.front_left_distance  = safe_min(front_left_idx)
+        self.front_right_distance = safe_min(front_right_idx)
+        self.left_distance        = safe_min(left_idx)
+        self.right_distance       = safe_min(right_idx)
+
+        # rest of existing scan_cb code stays the same...
+        if not self.active:
+            self.prev_scan = scan
+            return
+
+        # front_vals = [ranges[i] for i in front_idx
+        #               if scan.range_min < ranges[i] < scan.range_max
+        #               and not math.isinf(ranges[i])]
+        # self.front_distance = min(front_vals) if front_vals else float('inf')
 
         if not self.active:
             self.prev_scan = scan
@@ -281,6 +326,21 @@ class SeekCat(Node):
 
     def control_loop(self):
         if not self.active or self.target_cat is None:
+            return
+
+        # ── OBSTACLE SAFETY LAYER — highest priority ──────────────────────────
+        # Only during navigation and spinning — not during turning or following
+        if self.state in (self.STATE_WAYPOINT_NAV, self.STATE_WAYPOINT_SPIN,
+                        self.STATE_CHECK_OBJECTS):
+
+            if self.front_distance < SAFE_DISTANCE and not self.is_avoiding:
+                self.get_logger().warn(
+                    f'⚠️ OBSTACLE! front={self.front_distance:.2f}m — avoiding!')
+                self._enter_avoid()
+                return
+
+        if self.is_avoiding:
+            self._execute_avoid()
             return
 
         # ── FOLLOWING ─────────────────────────────────────────────────────────
@@ -571,6 +631,7 @@ class SeekCat(Node):
             self.get_logger().warn('Nav2 goal rejected!')
             self.nav_sent = False
             return
+        self._current_nav_handle = goal_handle  # save for cancellation
         self.get_logger().info('[Nav2] Goal accepted, navigating...')
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(self._nav_result_cb)
@@ -665,6 +726,69 @@ class SeekCat(Node):
                 current = [pt]
         clusters.append(current)
         return clusters
+
+    def _enter_avoid(self):
+        """Enter obstacle avoidance mode."""
+        self.is_avoiding     = True
+        self.avoid_start     = time.time()
+        self.pre_avoid_state = self.state
+        self.stop_robot()
+
+        # Cancel current Nav2 goal
+        if hasattr(self, '_current_nav_handle') and self._current_nav_handle:
+            self._current_nav_handle.cancel_goal_async()
+
+        # Choose turn direction toward more open space
+        if self.front_right_distance > self.front_left_distance:
+            self.avoid_turn_dir = -1  # turn right
+            self.get_logger().info(
+                f'[Avoid] Turning RIGHT '
+                f'(right={self.front_right_distance:.2f}m > '
+                f'left={self.front_left_distance:.2f}m)')
+        else:
+            self.avoid_turn_dir = 1   # turn left
+            self.get_logger().info(
+                f'[Avoid] Turning LEFT '
+                f'(left={self.front_left_distance:.2f}m >= '
+                f'right={self.front_right_distance:.2f}m)')
+
+    def _execute_avoid(self):
+        """Execute obstacle avoidance turn."""
+        elapsed = time.time() - self.avoid_start
+
+        if self.front_distance > AVOID_DISTANCE:
+            # Path is clear — resume previous state
+            self.get_logger().info(
+                f'[Avoid] Path clear ({self.front_distance:.2f}m) — resuming')
+            self.is_avoiding = False
+            self.stop_robot()
+
+            # Resume: re-send nav goal to same waypoint
+            if self.pre_avoid_state == self.STATE_WAYPOINT_NAV:
+                self.nav_sent = False  # re-send goal
+                self.state    = self.STATE_WAYPOINT_NAV
+            elif self.pre_avoid_state == self.STATE_WAYPOINT_SPIN:
+                self.state = self.STATE_WAYPOINT_SPIN
+            else:
+                self.state = self.STATE_CHECK_OBJECTS
+            return
+
+        # Still blocked — keep turning
+        if elapsed < RECOVERY_TURN_SEC * 3:
+            twist = Twist()
+            twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED
+
+            # If still blocked after first turn, try backing up slightly
+            if elapsed > RECOVERY_TURN_SEC and self.front_distance < SAFE_DISTANCE:
+                twist.linear.x  = -0.08
+                twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED * 0.5
+
+            self.cmd_pub.publish(twist)
+        else:
+            # Stuck for too long — flip turn direction and try other way
+            self.get_logger().warn('[Avoid] Stuck — trying other direction')
+            self.avoid_turn_dir  = -self.avoid_turn_dir
+            self.avoid_start     = time.time()
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
