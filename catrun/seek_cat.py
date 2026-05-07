@@ -67,6 +67,7 @@ WAYPOINTS = [
     ('L3',  1.396,  1.127),
     ('L4',  1.1,   -1.037),
     ('L5', -0.178, -1.31),
+    {'home', 0.0,   0.0},
 ]
 
 # ── states ────────────────────────────────────────────────────────────────────
@@ -357,7 +358,7 @@ class SeekCat(Node):
             f'[cycle {self.search_cycles+1}/{MAX_SEARCH_CYCLES}]')
         self._send_nav_goal(wx, wy)
         return
-        
+
         if not self.nav_sent:
             self.get_logger().info(
                 f'[Nav] → {label} ({wx:.2f}, {wy:.2f}) '
