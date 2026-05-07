@@ -40,14 +40,20 @@ LOST_TIMEOUT        = 5.0
 SAFE_DISTANCE       = 0.35
 AVOID_DISTANCE      = 0.50
 
-# LiDAR motion detection
-MOTION_DIST_THRESH  = 0.20   # increased to reduce false positives
-CLUSTER_MIN_POINTS  = 5      # increased to reduce noise
-CAT_SIZE_MIN        = 0.15
-CAT_SIZE_MAX        = 0.55
-CAT_DIST_MAX        = 2.5
-# Object must persist this many scans before acting on it
-OBJECT_PERSIST_COUNT = 3
+# LiDAR motion detection — tighter filters
+MOTION_DIST_THRESH   = 0.25   # was 0.20 — higher = less false positives
+CLUSTER_MIN_POINTS   = 8      # was 5 — more points = more confident
+CAT_SIZE_MIN         = 0.15
+CAT_SIZE_MAX         = 0.50
+CAT_DIST_MAX         = 2.5
+OBJ_MIN_DIST         = 0.60   # ignore objects closer than this (walls/obstacles)
+OBJ_MAX_CHECK        = 3      # max objects to check at once
+OBJECT_PERSIST_COUNT = 5      # was 3 — needs more scans to confirm
+
+# Obstacle avoidance — only for truly stuck
+SAFE_DISTANCE        = 0.25   # was 0.35 — only stop if VERY close
+AVOID_DISTANCE       = 0.35   # was 0.50
+AVOID_MIN_DURATION   = 3.0    # minimum time in avoid before resuming
 
 # Search
 MAX_SEARCH_CYCLES   = 3
@@ -274,7 +280,7 @@ class SeekCat(Node):
             cy    = sum(ys)/len(ys)
             dist  = math.sqrt(cx**2 + cy**2)
             angle = math.atan2(cy, cx)
-            if dist < SAFE_DISTANCE:
+            if dist < OBJ_MIN_DIST:   # ignore close objects (walls/furniture)
                 continue
 
             # Quantize angle to 20° bins for persistence tracking
@@ -437,22 +443,21 @@ class SeekCat(Node):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _interrupt_for_object(self):
-        """Called immediately when confirmed moving object detected."""
         if not self.pending_objects:
             return
 
+        # Only keep closest MAX objects
+        self.pending_objects = sorted(
+            self.pending_objects, key=lambda o: o[1])[:OBJ_MAX_CHECK]
+
         self.get_logger().info(
-            f'[Interrupt] Stopping — checking '
+            f'[Interrupt] Checking '
             f'{len(self.pending_objects)} confirmed object(s)!')
 
-        # Save current state to resume after checking
         self.pre_check_state    = self.state
         self.pre_check_wp_index = self.waypoint_index
-
-        # Cancel navigation
         self._cancel_nav()
         self._stop_motors()
-
         self.state             = CHECK_OBJ
         self.current_obj_index = 0
         self._start_obj_turn(0)
@@ -580,10 +585,17 @@ class SeekCat(Node):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _enter_avoid(self):
+        # Only enter avoid if Nav2 is NOT running
+        # If Nav2 is running it handles obstacles itself
+        if self.nav_sent and not self.nav_arrived:
+            self.get_logger().warn(
+                f'[Avoid] Obstacle {self.front_distance:.2f}m '
+                f'but Nav2 is active — letting Nav2 handle it')
+            return  # Nav2 handles it
+
         self.pre_avoid_state = self.state
         self.state           = AVOID
         self.avoid_start     = time.time()
-        self._cancel_nav()
         self._stop_motors()
 
         if self.open_directions:
@@ -601,6 +613,17 @@ class SeekCat(Node):
     def _loop_avoid(self):
         elapsed = time.time() - self.avoid_start
 
+        # Must stay in avoid for minimum duration
+        if elapsed < AVOID_MIN_DURATION:
+            twist = Twist()
+            if elapsed < 1.5:
+                twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED
+            else:
+                twist.linear.x  = -0.08
+                twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED * 0.5
+            self.cmd_pub.publish(twist)
+            return
+
         if self.front_distance > AVOID_DISTANCE:
             self.get_logger().info('[Avoid] ✅ Clear — resuming')
             self._stop_motors()
@@ -609,17 +632,16 @@ class SeekCat(Node):
             self.state       = NAVIGATE
             return
 
-        twist = Twist()
-        if elapsed < 2.0:
+        # Still blocked after minimum duration
+        if elapsed < AVOID_MIN_DURATION * 2:
+            twist = Twist()
             twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED
-        elif elapsed < 3.0:
-            twist.linear.x  = -0.08
-            twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED * 0.5
+            self.cmd_pub.publish(twist)
         else:
+            # Flip direction
             self.avoid_turn_dir = -self.avoid_turn_dir
             self.avoid_start    = time.time()
-
-        self.cmd_pub.publish(twist)
+            self.get_logger().warn('[Avoid] Still stuck — flipping direction')
 
     # ══════════════════════════════════════════════════════════════════════════
     # DONE
