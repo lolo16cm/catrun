@@ -12,36 +12,37 @@ def generate_launch_description():
 
     return LaunchDescription([
 
-        # Terminal 2 — TF base_link → laser
+        # TF base_link → laser
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='tf_base_link_laser',
             arguments=['0', '0', '0.19', '3.14159', '0', '0',
                        'base_link', 'laser'],
-            parameters=[{'publish_period_ms': 500}],  # publish every 500ms not 100ms
+            parameters=[{'publish_period_ms': 500}],
         ),
 
-        # Terminal 3 — TF base_link → base_footprint
+        # TF base_link → base_footprint
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='tf_base_link_footprint',
             arguments=['0', '0', '0', '0', '0', '0',
                        'base_link', 'base_footprint'],
-            parameters=[{'publish_period_ms': 500}],  # publish every 500ms not 100ms
+            parameters=[{'publish_period_ms': 500}],
         ),
 
-        # Terminal 4 — rf2o odometry
+        # rf2o odometry
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                os.path.join(rf2o_dir, 'launch', 'rf2o_laser_odometry.launch.py')
+                os.path.join(rf2o_dir, 'launch',
+                             'rf2o_laser_odometry.launch.py')
             ),
         ),
 
-        # Terminal 5 — Nav2 + AMCL + map (delayed 3s to let TF settle)
+        # Nav2 + AMCL + map (delayed 5s)
         TimerAction(
-            period=3.0,
+            period=5.0,
             actions=[
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(
@@ -55,10 +56,10 @@ def generate_launch_description():
                 ),
             ]
         ),
-        
-        # Add inside LaunchDescription, after Nav2 TimerAction
+
+        # Set initial pose (delayed 15s)
         TimerAction(
-            period=10.0,  # Wait 10s for Nav2 + AMCL to fully start
+            period=15.0,
             actions=[
                 Node(
                     package='catrun',
@@ -68,4 +69,5 @@ def generate_launch_description():
                 ),
             ]
         ),
+
     ])

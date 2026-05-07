@@ -125,6 +125,8 @@ class SeekCat(Node):
         self.front_distance   = float('inf')
         self.front_left_dist  = float('inf')
         self.front_right_dist = float('inf')
+        self.left_distance    = float('inf')
+        self.right_distance   = float('inf')
         self.open_directions  = []
 
         # Avoid
@@ -213,6 +215,8 @@ class SeekCat(Node):
             list(range(0, n//12)) + list(range(11*n//12, n)))
         self.front_left_dist  = safe_min(list(range(n//12, n//4)))
         self.front_right_dist = safe_min(list(range(3*n//4, 11*n//12)))
+        self.left_distance  = safe_min(list(range(n//4,  5*n//12)))
+        self.right_distance = safe_min(list(range(7*n//12, 3*n//4)))
 
         # Open directions for navigation
         open_dirs = []
@@ -558,23 +562,55 @@ class SeekCat(Node):
             self._stop_motors()
             return
 
-        if self.front_distance < SAFE_DISTANCE:
-            self._stop_motors()
-            return
-
         twist = Twist()
+
+        # Angular: proportional steering
         error           = (self.cat_cx * 640) - 320
         twist.angular.z = -error / 300.0
 
+        # Linear: maintain 1 foot distance
+        # Camera faces BACK → robot moves BACKWARD to follow cat
         dist = self.cat_dist if self.cat_dist is not None else self.front_distance
+
         if dist is not None and not math.isinf(dist):
             dist_error = dist - FOLLOW_DIST_TARGET
+
             if dist_error > 0.05:
-                twist.linear.x = -min(FOLLOW_SPEED_MAX, dist_error * 0.4)
+                # Too far → move BACKWARD toward cat
+                # Check front obstacle (front = away from cat since camera faces back)
+                if self.front_distance < SAFE_DISTANCE:
+                    self.get_logger().warn(
+                        f'[Follow] Too far but obstacle ahead '
+                        f'{self.front_distance:.2f}m — turning only',
+                        throttle_duration_sec=1.0)
+                    twist.linear.x = 0.0
+                else:
+                    twist.linear.x = -min(FOLLOW_SPEED_MAX, dist_error * 0.4)
+
             elif dist_error < -0.05:
-                twist.linear.x = max(0.10, abs(dist_error) * 0.4)
+                # Too close → move FORWARD away from cat
+                # Check back obstacle using left+right as proxy
+                back_clear = (self.left_distance > SAFE_DISTANCE and
+                            self.right_distance > SAFE_DISTANCE)
+                if back_clear:
+                    twist.linear.x = min(0.15, abs(dist_error) * 0.4)
+                    self.get_logger().info(
+                        f'[Follow] Too close ({dist:.2f}m) — moving forward',
+                        throttle_duration_sec=1.0)
+                else:
+                    # No room to back away — just stop
+                    twist.linear.x = 0.0
+                    self.get_logger().warn(
+                        f'[Follow] Too close but no room to move — stopping',
+                        throttle_duration_sec=1.0)
             else:
+                # Sweet spot — maintain position
                 twist.linear.x = 0.0
+
+            self.get_logger().info(
+                f'[Follow] dist={dist:.2f}m err={dist_error:.2f}m '
+                f'lin={twist.linear.x:.2f} ang={twist.angular.z:.2f}',
+                throttle_duration_sec=0.5)
         else:
             twist.linear.x = 0.0
 
