@@ -1,9 +1,33 @@
+"""
+catrun.launch.py - Definitive bringup for catrun robot.
+
+Order of operations:
+  t=0s   TF (base_link -> laser, base_link -> base_footprint)
+  t=0s   RPLiDAR starts publishing /scan
+  t=3s   rf2o laser odometry (after /scan is alive)
+  t=8s   Nav2 localization (map_server + amcl)
+  t=10s  Initial pose published continuously to /initialpose for 60 seconds
+         (bypasses set_pose entirely; uses ros2 topic pub directly)
+  t=22s  Nav2 navigation (planner, controller, bt_navigator, etc.)
+         By now AMCL has been getting initial pose for 12s and is
+         publishing map->odom in TF, so costmaps configure cleanly.
+
+EDIT INITIAL_POSE_X / Y / YAW_DEG below to match where your robot starts.
+"""
+
 from launch import LaunchDescription
-from launch_ros.actions import Node
-from launch.actions import IncludeLaunchDescription, TimerAction
+from launch.actions import IncludeLaunchDescription, TimerAction, ExecuteProcess
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
 import os
+import math
+
+
+# EDIT THESE TO MATCH YOUR ROBOT'S STARTING POSE
+INITIAL_POSE_X       = 0.0    # meters in the map frame
+INITIAL_POSE_Y       = 0.0
+INITIAL_POSE_YAW_DEG = 90.0   # degrees: 0 = +X, 90 = +Y, 180 = -X, -90 = -Y
 
 
 def generate_launch_description():
@@ -11,13 +35,35 @@ def generate_launch_description():
     map_file = os.path.join(
         get_package_share_directory("catrun"), "map", "my_map.yaml")
 
+    # Convert yaw to quaternion z, w (rotation about Z axis)
+    yaw_rad = math.radians(INITIAL_POSE_YAW_DEG)
+    qz = math.sin(yaw_rad / 2.0)
+    qw = math.cos(yaw_rad / 2.0)
+
+    # Build the YAML message string for ros2 topic pub
+    initial_pose_yaml = (
+        "{"
+        "header: {frame_id: 'map'}, "
+        "pose: {"
+            "pose: {"
+                f"position: {{x: {INITIAL_POSE_X}, y: {INITIAL_POSE_Y}, z: 0.0}}, "
+                f"orientation: {{x: 0.0, y: 0.0, z: {qz}, w: {qw}}}"
+            "}, "
+            "covariance: ["
+                "0.25, 0.0, 0.0, 0.0, 0.0, 0.0, "
+                "0.0, 0.25, 0.0, 0.0, 0.0, 0.0, "
+                "0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "
+                "0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "
+                "0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "
+                "0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891945200942"
+            "]"
+        "}"
+        "}"
+    )
+
     return LaunchDescription([
 
-        # ─── t=0s: TF tree ────────────────────────────────────────────────
-        # Static transforms — must be up before anything else subscribes
-        # to TF, so Nav2's costmaps can resolve frames immediately.
-
-        # TF base_link -> laser
+        # t=0s: TF tree
         Node(
             package="tf2_ros",
             executable="static_transform_publisher",
@@ -27,7 +73,6 @@ def generate_launch_description():
             output="screen",
         ),
 
-        # TF base_link -> base_footprint
         Node(
             package="tf2_ros",
             executable="static_transform_publisher",
@@ -37,8 +82,7 @@ def generate_launch_description():
             output="screen",
         ),
 
-        # ─── t=0s: RPLiDAR ────────────────────────────────────────────────
-        # Starts immediately so /scan is publishing before rf2o subscribes.
+        # t=0s: RPLiDAR
         Node(
             package="rplidar_ros",
             executable="rplidar_composition",
@@ -53,9 +97,7 @@ def generate_launch_description():
             output="screen",
         ),
 
-        # ─── t=3s: rf2o laser odometry ────────────────────────────────────
-        # Delayed so /scan is alive first; otherwise rf2o spams
-        # "Waiting for laser_scans..." until LiDAR comes up.
+        # t=3s: rf2o laser odometry
         TimerAction(
             period=3.0,
             actions=[
@@ -69,10 +111,7 @@ def generate_launch_description():
             ]
         ),
 
-        # ─── t=8s: Localization (map_server + amcl) ───────────────────────
-        # Started FIRST so the `map` frame is being published BEFORE
-        # the navigation stack's costmaps try to look it up.
-        # This is the fix for controller_server hanging in inactive [2].
+        # t=8s: Nav2 localization (map_server + amcl)
         TimerAction(
             period=8.0,
             actions=[
@@ -89,29 +128,34 @@ def generate_launch_description():
             ]
         ),
 
-        # ─── t=14s: Set initial pose ──────────────────────────────────────
-        # Done AFTER localization is up so AMCL has somewhere to put the
-        # pose. Done BEFORE navigation starts so by the time the costmap
-        # configures, AMCL is publishing map->odom and the `map` frame
-        # is resolvable in TF.
+        # t=10s: Publish initial pose continuously for 60 seconds
+        # Bypasses the buggy set_pose.py entirely.
+        # ros2 topic pub keeps the publisher alive long enough for DDS
+        # discovery to complete (~1-2s), then keeps publishing to
+        # guarantee AMCL receives at least one message.
         TimerAction(
-            period=14.0,
+            period=10.0,
             actions=[
-                Node(
-                    package="catrun",
-                    executable="set_pose",
-                    name="set_initial_pose",
+                ExecuteProcess(
+                    cmd=[
+                        "ros2", "topic", "pub",
+                        "--rate", "1",
+                        "--times", "60",
+                        "/initialpose",
+                        "geometry_msgs/msg/PoseWithCovarianceStamped",
+                        initial_pose_yaml,
+                    ],
                     output="screen",
+                    name="initial_pose_publisher",
                 ),
             ]
         ),
 
-        # ─── t=18s: Navigation (planner, controller, bt_navigator, etc.) ─
-        # By now: TF tree complete, /scan flowing, /odom flowing,
-        # map_server active, amcl active, initial pose set, `map` frame
-        # being published in TF. Costmaps configure cleanly.
+        # t=22s: Nav2 navigation stack
+        # By now AMCL has been receiving initial pose for 12 seconds and
+        # is publishing map->odom in TF. Costmaps configure cleanly.
         TimerAction(
-            period=18.0,
+            period=22.0,
             actions=[
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(
