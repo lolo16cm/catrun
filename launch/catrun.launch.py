@@ -48,8 +48,12 @@ INITIAL_POSE_YAW_DEG = 90.0    # 0=+X, 90=+Y, 180=-X, -90=-Y
 # Per-camera focal_px for distance estimation. Calibrate by placing the
 # cat plushie at exactly 1 m, reading the bbox= value from the annotated
 # stream, and computing focal_px = bbox_width_at_1m / 0.25.
-FRONT_FOCAL_PX = 600.0   # CSI camera, 1280x720 (your existing default)
-REAR_FOCAL_PX  = 500.0   # USB camera, 640x480 - placeholder, please calibrate
+#
+# NOTE: When you change camera resolution, focal_px scales linearly.
+# At 1280x720 the calibration was 600. At 640x360 (half), it's ~300.
+# Recalibrate by placing the plushie at 1m and reading the bbox width.
+FRONT_FOCAL_PX = 300.0   # CSI camera at 640x360 - recalibrate for your robot
+REAR_FOCAL_PX  = 500.0   # USB camera at 640x480 - placeholder, please calibrate
 # ────────────────────────────────────────────────────────────────────────
 
 
@@ -145,9 +149,13 @@ def _build_actions(context, *args, **kwargs):
         camera_params = {
             'camera_source': 'csi0',
             'flip_method':   2,
-            'width':         1280,
-            'height':        720,
-            'framerate':     30,
+            # Lower resolution + slower framerate = much less CPU/bandwidth.
+            # YOLO downscales to imgsz=192 internally anyway, so giving it
+            # 1280x720 was wasteful. 640x360 keeps plenty of detail for cat
+            # detection while letting camera_node publish at full rate.
+            'width':         640,
+            'height':        360,
+            'framerate':     15,
         }
         detector_params = {
             'mode':     'watch',

@@ -51,7 +51,13 @@ CAT_CLASSES        = ['eevee', 'pichu', 'raichu']
 YOLO_CAT_CLASS_ID  = 15
 YOLO_CONF_THRESH   = 0.5
 MN_CONF_THRESH     = 0.70
-ALWAYS_ON_INTERVAL = 0.1
+# YOLO inference resolution. Smaller = much faster on Jetson CPU.
+# At 192 a cat plushie is still ~30-60 px wide so detection is reliable.
+YOLO_IMGSZ         = 192
+# Time between YOLO runs when no trigger is pending. Lower = snappier
+# detection but more CPU. 0.25 = 4 Hz which is fine for cats and lets
+# the Jetson CPU breathe.
+ALWAYS_ON_INTERVAL = 0.25
 
 # Multi-frame confirmation
 CONFIRM_WINDOW = 5
@@ -239,7 +245,7 @@ class CatDetector(Node):
         bbox_w  = 0
 
         try:
-            results = self.yolo(frame, verbose=False, stream=True, imgsz=320)
+            results = self.yolo(frame, verbose=False, stream=True, imgsz=YOLO_IMGSZ)
         except Exception as e:
             self.get_logger().error(f'YOLO error: {e}')
             return
