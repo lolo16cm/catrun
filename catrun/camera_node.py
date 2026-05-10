@@ -19,9 +19,12 @@ Parameters
   camera_source : str   'csi0' | 'csi1' | 'usb1' | 'usb0'   (default: csi0)
   flip_method   : int   nvvidconv flip-method for CSI cams  (default: 2)
                         0=none, 2=180deg, 4=horiz flip, 6=vert flip ...
-  width         : int   capture width  (default: 1280 for CSI, 640 for USB)
-  height        : int   capture height (default: 720  for CSI, 480 for USB)
-  framerate     : int   target fps (default: 30; publish rate is fps/2)
+  width         : int   output (downscaled) width            (default: CSI 640, USB 640)
+  height        : int   output (downscaled) height           (default: CSI 360, USB 480)
+  framerate     : int   publish rate in Hz                   (default: 15)
+                        Note: CSI capture is ALWAYS native 1920x1080@60.
+                        nvvidconv downscales on GPU to width/height.
+                        The python timer publishes at `framerate` Hz.
   device_path   : str   override for usbN, e.g. '/dev/video1' (default: derived)
 """
 
@@ -32,19 +35,34 @@ from cv_bridge import CvBridge
 import cv2
 
 
-def build_csi_pipeline(sensor_id, width, height, framerate, flip_method):
+# CSI capture mode: we always capture at native 1920x1080@60 because the
+# IMX477 supports this fast mode reliably (confirmed via gst-launch).
+# Asking nvarguscamerasrc for arbitrary downscaled resolutions can force
+# a slow path or fail. nvvidconv downscales on the GPU for free.
+CSI_CAPTURE_W   = 1920
+CSI_CAPTURE_H   = 1080
+CSI_CAPTURE_FPS = 60
+
+
+def build_csi_pipeline(sensor_id, out_w, out_h, flip_method):
     """GStreamer pipeline for a CSI camera via nvarguscamerasrc.
 
-    Low-latency tuning:
-      - appsink: max-buffers=1, drop=1, sync=false -> keep only newest
-      - leaky queue between stages so old frames are dropped if a stage stalls
+    Strategy:
+      - Capture at native IMX477 1920x1080@60 (known-good fast mode).
+      - Downscale to (out_w, out_h) on the GPU using nvvidconv.
+      - appsink drops all but the newest frame: drop=1, max-buffers=1.
+
+    The Python timer in CameraNode controls publish rate independently
+    of the 60 Hz capture - publishing at 15 Hz simply means we discard
+    3 of every 4 captured frames at the appsink boundary.
     """
     return (
         f'nvarguscamerasrc sensor-id={sensor_id} ! '
-        f'video/x-raw(memory:NVMM), width={width}, height={height}, '
-        f'framerate={framerate}/1 ! '
+        f'video/x-raw(memory:NVMM), width={CSI_CAPTURE_W}, '
+        f'height={CSI_CAPTURE_H}, framerate={CSI_CAPTURE_FPS}/1, '
+        f'format=NV12 ! '
         f'nvvidconv flip-method={flip_method} ! '
-        f'video/x-raw, format=BGRx ! '
+        f'video/x-raw, width={out_w}, height={out_h}, format=BGRx ! '
         f'queue leaky=downstream max-size-buffers=1 ! '
         f'videoconvert ! '
         f'video/x-raw, format=BGR ! '
@@ -77,7 +95,7 @@ class CameraNode(Node):
         self.declare_parameter('flip_method', 2)
         self.declare_parameter('width', 0)        # 0 = pick a sensible default
         self.declare_parameter('height', 0)
-        self.declare_parameter('framerate', 30)
+        self.declare_parameter('framerate', 15)   # publish rate in Hz
         self.declare_parameter('device_path', '')
 
         source      = self.get_parameter('camera_source').value.lower().strip()
@@ -93,13 +111,15 @@ class CameraNode(Node):
         # ─── pick the right pipeline ──────────────────────────────────
         if source in ('csi0', 'csi1'):
             sensor_id = 0 if source == 'csi0' else 1
-            if width  == 0: width  = 1280
-            if height == 0: height = 720
+            if width  == 0: width  = 640
+            if height == 0: height = 360
             pipeline = build_csi_pipeline(
-                sensor_id, width, height, framerate, flip_method)
+                sensor_id, width, height, flip_method)
             self.get_logger().info(
                 f'[Camera] CSI sensor-id={sensor_id} '
-                f'{width}x{height}@{framerate} flip={flip_method}')
+                f'capture={CSI_CAPTURE_W}x{CSI_CAPTURE_H}@{CSI_CAPTURE_FPS} '
+                f'-> out {width}x{height} publish={framerate}Hz '
+                f'flip={flip_method}')
 
         elif source in ('usb0', 'usb1') or source.startswith('/dev/video'):
             if not device_path:
@@ -114,8 +134,7 @@ class CameraNode(Node):
             pipeline = build_usb_pipeline(
                 device_path, width, height, framerate)
             self.get_logger().info(
-                f'[Camera] USB {device_path} '
-                f'{width}x{height}@{framerate}')
+                f'[Camera] USB {device_path} {width}x{height}@{framerate}')
 
         else:
             self.get_logger().error(
@@ -148,41 +167,31 @@ class CameraNode(Node):
         self.get_logger().info(
             f'Camera opened! Publishing to /camera/catrun ({source})')
 
-        # Force OpenCV's internal buffer to size 1 so cv2.VideoCapture.read()
-        # returns the newest frame instead of an old one from the queue.
-        # This is essential for low latency.
+        # Force OpenCV's internal buffer to size 1 so cap.read() returns
+        # the newest frame, not a queued old one.
         try:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
 
-        # Publish at the same rate the camera produces frames. Publishing
-        # slower than the camera's framerate causes lag because frames
-        # accumulate in the GStreamer/OpenCV buffer between reads.
-        publish_rate = framerate
-        self.create_timer(1.0 / publish_rate, self.timer_callback)
-        self._last_publish_warn_t = 0.0
+        # Publish rate timer. Capture is at 60fps, publish at framerate.
+        # With `drop=1 max-buffers=1` in appsink, each read returns the
+        # latest captured frame - older ones are discarded automatically.
+        self.create_timer(1.0 / framerate, self.timer_callback)
 
     def timer_callback(self):
-        # Drain any stale frames from the buffer so we publish the
-        # newest one. With max-buffers=1 in the GStreamer appsink and
-        # CAP_PROP_BUFFERSIZE=1 in OpenCV this should usually be a
-        # single read, but the loop is defensive against driver-level
-        # buffering on USB cameras.
-        latest = None
-        for _ in range(3):
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
-                latest = frame
-            else:
-                break
-
-        if latest is None:
+        # ONE read per tick = the newest frame. The previous version did
+        # a 3x "drain" loop, but with appsink drop=1 max-buffers=1 the
+        # second read BLOCKS waiting for a new frame from GStreamer,
+        # which capped publish rate at ~10 Hz. Single read is correct
+        # AND fast.
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
             self.get_logger().warn('Failed to grab frame',
                                    throttle_duration_sec=2.0)
             return
 
-        msg = self.bridge.cv2_to_imgmsg(latest, 'bgr8')
+        msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = 'camera'
         self.pub.publish(msg)
