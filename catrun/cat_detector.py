@@ -10,6 +10,11 @@ Publishes:
                          z = ESTIMATED DISTANCE in meters (from bbox width)
   /cat_detection/image - annotated frame
 
+The same detector serves BOTH watch and play modes; only the camera
+feeding /camera/catrun changes (front CSI in watch, rear USB in play).
+The `mode` parameter is purely cosmetic - it tags the logs so it's
+obvious which mode the detector is currently serving.
+
 Distance estimation:
   No depth sensor available, so we use the same trick the ball follower
   reference uses: a known-width object's bbox-pixel-width is inversely
@@ -58,11 +63,14 @@ ENTRY_TTL_SEC  = 2.0
 #
 # CALIBRATION:
 #   1. Place the cat plushie EXACTLY 1 meter from the camera
-#   2. Watch the annotated stream — note the bbox width shown as "bbox=NNN"
-#   3. Set CAMERA_FOCAL_PX = bbox_width_at_1m / CAT_REAL_WIDTH_M
-# Defaults below are reasonable starting values.
+#   2. Watch the annotated stream - note the bbox width shown as "bbox=NNN"
+#   3. Set focal_px (ROS param) = bbox_width_at_1m / CAT_REAL_WIDTH_M
+#
+# NOTE: The front CSI cam (1280x720) and the rear USB cam (640x480) almost
+# certainly have different focal-px values. Calibrate each one and pass
+# the right value via the launch file's `focal_px` parameter.
 CAT_REAL_WIDTH_M = 0.25      # ~25 cm wide plushie - measure your actual one
-CAMERA_FOCAL_PX  = 600.0     # Pi camera at 640x480 ish; tune via calibration
+CAMERA_FOCAL_PX  = 600.0     # default; override with ROS param `focal_px`
 DIST_MIN_M       = 0.10
 DIST_MAX_M       = 5.00
 
@@ -74,10 +82,10 @@ TRANSFORM = T.Compose([
 ])
 
 
-def estimate_distance_m(bbox_width_px):
+def estimate_distance_m(bbox_width_px, focal_px):
     if bbox_width_px <= 1:
         return None
-    d = (CAT_REAL_WIDTH_M * CAMERA_FOCAL_PX) / float(bbox_width_px)
+    d = (CAT_REAL_WIDTH_M * float(focal_px)) / float(bbox_width_px)
     return max(DIST_MIN_M, min(DIST_MAX_M, d))
 
 
@@ -86,12 +94,33 @@ class CatDetector(Node):
     def __init__(self):
         super().__init__('cat_detector')
 
+        # ─── parameters ───────────────────────────────────────────────
+        # `mode` is just a label used in logs so you can tell which
+        # behavior is currently consuming the feed (watch vs play).
+        self.declare_parameter('mode', 'watch')
+        self.declare_parameter('focal_px', CAMERA_FOCAL_PX)
+
+        self.mode     = str(self.get_parameter('mode').value).lower().strip()
+        self.focal_px = float(self.get_parameter('focal_px').value)
+        if self.mode not in ('watch', 'play'):
+            self.get_logger().warn(
+                f"Unknown mode '{self.mode}', defaulting to 'watch'")
+            self.mode = 'watch'
+
         self.get_logger().info('Loading YOLOv8...')
         self.yolo = YOLO(YOLO_MODEL_PATH)
         self.yolo.to('cpu')
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.classifier = self._load_classifier()
+        # Play mode only needs YOLO ("is it a cat?") - skip MobileNetV2
+        # entirely to save CPU/RAM on the Orin Nano. Watch mode still
+        # needs the classifier to tell eevee/pichu/raichu apart.
+        if self.mode == 'play':
+            self.get_logger().info(
+                '[play] Skipping MobileNetV2 - YOLO-only detection')
+            self.classifier = None
+        else:
+            self.classifier = self._load_classifier()
 
         self.bridge          = CvBridge()
         self.target_cat      = None
@@ -119,12 +148,12 @@ class CatDetector(Node):
         self.create_timer(3.0,  self.status_cb)
 
         self.get_logger().info('=' * 50)
-        self.get_logger().info('CatDetector ready!')
-        self.get_logger().info(f'  Classes : {CAT_CLASSES}')
-        self.get_logger().info(f'  Device  : {self.device}')
-        self.get_logger().info(f'  Confirm : {CONFIRM_HITS} of {CONFIRM_WINDOW}')
-        self.get_logger().info(f'  Distance: real_w={CAT_REAL_WIDTH_M}m '
-                               f'focal={CAMERA_FOCAL_PX}px')
+        self.get_logger().info(f'CatDetector ready! [mode={self.mode}]')
+        self.get_logger().info(f'  Classes  : {CAT_CLASSES}')
+        self.get_logger().info(f'  Device   : {self.device}')
+        self.get_logger().info(f'  Confirm  : {CONFIRM_HITS} of {CONFIRM_WINDOW}')
+        self.get_logger().info(f'  Distance : real_w={CAT_REAL_WIDTH_M}m '
+                               f'focal={self.focal_px}px')
         self.get_logger().info('=' * 50)
 
     def _load_classifier(self):
@@ -144,15 +173,31 @@ class CatDetector(Node):
 
     def target_cb(self, msg: String):
         text = msg.data.strip().lower()
+
+        # Play mode: classifier disabled - we don't care WHICH cat the
+        # user named, any cat triggers flee. Just remember we're armed.
+        if self.mode == 'play':
+            if text in ('', 'stop', 'none'):
+                self.target_cat = None
+                self.detection_history.clear()
+                self.get_logger().info('[play] Disarmed.')
+            else:
+                self.target_cat = 'any'
+                self.detection_history.clear()
+                self.get_logger().info('[play] Armed - any cat triggers flee.')
+            return
+
+        # Watch mode: identify the specific cat the user named.
         for name in CAT_CLASSES:
             if name in text:
                 self.target_cat = name
                 self.detection_history.clear()
-                self.get_logger().info(f'Target cat: {self.target_cat}')
+                self.get_logger().info(
+                    f'[{self.mode}] Target cat: {self.target_cat}')
                 return
         self.target_cat = None
         self.detection_history.clear()
-        self.get_logger().info('Target cleared.')
+        self.get_logger().info(f'[{self.mode}] Target cleared.')
 
     def trigger_cb(self, msg: String):
         self.triggered = True
@@ -160,7 +205,8 @@ class CatDetector(Node):
     def image_cb(self, msg: Image):
         self.frame_count += 1
         if self.frame_count == 1:
-            self.get_logger().info(f'Camera connected! {msg.width}x{msg.height}')
+            self.get_logger().info(
+                f'[{self.mode}] Camera connected! {msg.width}x{msg.height}')
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
             with self.frame_lock:
@@ -224,7 +270,7 @@ class CatDetector(Node):
             cx_norm = float((x1 + x2) / 2) / w
             cy_norm = float((y1 + y2) / 2) / h
             bbox_w  = x2 - x1
-            dist_m  = estimate_distance_m(bbox_w) or 0.0
+            dist_m  = estimate_distance_m(bbox_w, self.focal_px) or 0.0
 
             color = (0, 255, 100)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
@@ -262,8 +308,11 @@ class CatDetector(Node):
                 confirmed_name = name
                 break
 
-        # Filter by target if set
-        if self.target_cat and confirmed_name != self.target_cat:
+        # Filter by target if set. The special value 'any' (used in play
+        # mode) accepts any confirmed cat - we don't care which one.
+        if (self.target_cat
+                and self.target_cat != 'any'
+                and confirmed_name != self.target_cat):
             self._add_vote_overlay(annotated, name_counts, fresh)
             self._publish_annotated(annotated)
             return
@@ -280,14 +329,14 @@ class CatDetector(Node):
         # Average bbox width then re-estimate distance (more stable than
         # averaging distances directly because distance is 1/x in width)
         avg_bbox = sum(e['bbox_w'] for e in hits) / len(hits)
-        avg_dist = estimate_distance_m(avg_bbox) or 0.0
+        avg_dist = estimate_distance_m(avg_bbox, self.focal_px) or 0.0
         avg_conf = sum(e['conf'] for e in hits) / len(hits)
 
         self.confirmed_count += 1
         self.detection_count += 1
 
         self.get_logger().info(
-            f'CONFIRMED: {confirmed_name} '
+            f'[{self.mode}] CONFIRMED: {confirmed_name} '
             f'({len(hits)}/{len(fresh)}) '
             f'cx={avg_cx:.2f} dist~{avg_dist:.2f}m bbox={avg_bbox:.0f}px '
             f'conf={avg_conf:.2f}')
@@ -299,17 +348,17 @@ class CatDetector(Node):
         pt.header.frame_id = 'camera'
         pt.point.x = avg_cx
         pt.point.y = avg_cy
-        pt.point.z = avg_dist     # ← actual distance in meters now!
+        pt.point.z = avg_dist     # actual distance in meters
         self.pub_position.publish(pt)
 
         cv2.putText(annotated,
-                    f'CONFIRMED {confirmed_name} dist~{avg_dist:.2f}m',
+                    f'[{self.mode}] CONFIRMED {confirmed_name} dist~{avg_dist:.2f}m',
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         self._publish_annotated(annotated)
 
     def _add_vote_overlay(self, img, name_counts, fresh):
         y = 30
-        cv2.putText(img, f'frames: {len(fresh)}/{CONFIRM_WINDOW}',
+        cv2.putText(img, f'[{self.mode}] frames: {len(fresh)}/{CONFIRM_WINDOW}',
                     (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         y += 20
         if name_counts:
@@ -347,10 +396,12 @@ class CatDetector(Node):
 
     def status_cb(self):
         if self.frame_count == 0:
-            self.get_logger().warn('No frames yet! Check: ros2 topic hz /camera/catrun')
+            self.get_logger().warn(
+                f'[{self.mode}] No frames yet! '
+                f'Check: ros2 topic hz /camera/catrun')
         else:
             self.get_logger().info(
-                f'frames={self.frame_count} | '
+                f'[{self.mode}] frames={self.frame_count} | '
                 f'detections={self.detection_count} | '
                 f'confirmed={self.confirmed_count} | '
                 f'target={self.target_cat or "any"}')

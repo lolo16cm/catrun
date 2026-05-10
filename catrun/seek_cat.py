@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-seek_cat.py - Fixed
-==================
-  - Rear-camera follow geometry (chase backward, retreat forward)
-  - Continuous-spin object check
-  - Trusts cat_detector's multi-frame confirmation
-  - Distance now estimated from bbox width by cat_detector
-  - When distance is unavailable, falls back to slow constant-speed crawl
-    toward cat (same approach as the ball follower reference)
-  - Robust shutdown
+seek_cat.py - WATCH MODE
+========================
+The robot navigates waypoints, scans for cats with the FRONT camera,
+and when the target cat is confirmed, it FOLLOWS it forward.
+
+Follow geometry follows the ball-follower assignment exactly:
+  * Camera faces forward (front CSI camera).
+  * cat_cx > 0.5  -> cat is on the right of the image -> turn RIGHT
+                     (i.e. NEGATIVE angular.z, just like the assignment's
+                     `twist.angular.z = -error / 300`).
+  * dist > target -> too far  -> drive FORWARD  (linear.x > 0)
+  * dist < target -> too close -> drive BACKWARD (linear.x < 0)
+  * No distance   -> crawl forward at 0.05 m/s (assignment fallback)
+
+Other behavior:
+  * Continuous-spin object check (LiDAR-confirmed moving objects)
+  * Trusts cat_detector's multi-frame confirmation
+  * Distance estimated from bbox width by cat_detector (point.z)
+  * Robust shutdown
 """
 
 import math
@@ -31,19 +41,21 @@ LINEAR_SPEED        = 0.15
 # Camera
 CAMERA_HFOV_DEG     = 63.0
 CAMERA_HFOV_RAD     = math.radians(CAMERA_HFOV_DEG)
-CAMERA_OFFSET_RAD   = math.pi
+# Front camera points the same way as +X (forward) of base_link, so the
+# camera-vs-LiDAR offset is 0. (Was pi for the rear-cam version.)
+CAMERA_OFFSET_RAD   = 0.0
 YOLO_PAUSE_SEC      = 2.0
 
-# Follow
-FOLLOW_DIST_TARGET  = 1.0
-FOLLOW_TOLERANCE    = 0.15
-FOLLOW_SPEED_MAX    = 0.20
-FOLLOW_KP_LIN       = 0.4
-FOLLOW_KP_ANG       = 1.5
-LOST_TIMEOUT        = 5.0
-# When depth/distance is unavailable, crawl backward at this speed
-# (rear-camera version of the ball follower's "linear.x = 0.05")
-FOLLOW_NO_DEPTH_SPEED = 0.05   # m/s, backward toward cat
+# Follow (forward-camera, ball-follower style)
+FOLLOW_DIST_TARGET    = 1.0
+FOLLOW_TOLERANCE      = 0.15
+FOLLOW_SPEED_MAX      = 0.20
+FOLLOW_KP_LIN         = 0.4
+FOLLOW_KP_ANG         = 1.5
+LOST_TIMEOUT          = 5.0
+# Constant slow forward crawl when no distance estimate is available
+# (matches the assignment's `twist.linear.x = 0.05` no-depth fallback).
+FOLLOW_NO_DEPTH_SPEED = 0.05   # m/s, forward toward cat
 
 # LiDAR motion detection
 MOTION_DIST_THRESH   = 0.25
@@ -153,7 +165,7 @@ class SeekCat(Node):
         self.status_pub = self.create_publisher(String, '/seek_status',          10)
 
         self.create_timer(0.1, self._loop)
-        self.get_logger().info('SeekCat ready - rear-cam follow with crawl fallback')
+        self.get_logger().info('SeekCat ready - FRONT-cam follow (ball-follower geometry)')
 
     # Callbacks
     def _cb_target(self, msg: String):
@@ -186,7 +198,7 @@ class SeekCat(Node):
 
     def _cb_position(self, msg: PointStamped):
         self.cat_cx    = msg.point.x
-        # cat_detector now publishes estimated distance as point.z
+        # cat_detector publishes estimated distance as point.z
         self.cat_dist  = msg.point.z if msg.point.z > 0.05 else None
         self.last_seen = self.get_clock().now()
         if self.state in (NAVIGATE, CHECK_OBJ, YOLO_WAIT, AVOID):
@@ -464,9 +476,12 @@ class SeekCat(Node):
             self.state             = NAVIGATE
             return
 
+        # Front-camera: rotate the BASE so the camera (= +X axis) faces
+        # the object. The camera and base both look forward, so
+        # cam_angle == angle.
         angle, dist  = self.pending_objects[idx]
-        cam_angle    = normalize_angle(angle + CAMERA_OFFSET_RAD)
-        turn_sec     = CAMERA_HFOV_RAD / ANGULAR_SPEED
+        cam_angle    = normalize_angle(angle + CAMERA_OFFSET_RAD)   # +0
+        turn_sec     = abs(cam_angle) / ANGULAR_SPEED
 
         self.current_obj_index = idx
         self.turn_start        = time.time()
@@ -476,7 +491,7 @@ class SeekCat(Node):
         self.get_logger().info(
             f'[Check] Object {idx+1}/{len(self.pending_objects)} '
             f'at {math.degrees(angle):.0f} deg dist={dist:.2f}m - '
-            f'turning camera toward it')
+            f'turning to face it ({turn_sec:.1f}s)')
 
     def _loop_check_obj(self):
         now     = time.time()
@@ -512,15 +527,22 @@ class SeekCat(Node):
             self._start_obj_turn(self.current_obj_index)
 
     # ──────────────────────────────────────────────────────────────────
-    # FOLLOW - REAR-CAMERA GEOMETRY
-    # The camera faces BACKWARD. So:
-    #   - To CHASE (close gap):  drive BACKWARD (linear.x < 0)
-    #   - To RETREAT (open gap): drive FORWARD  (linear.x > 0)
-    # cat_cx > 0.5 means cat is on camera-right = robot's LEFT, turn LEFT.
+    # FOLLOW - FRONT-CAMERA GEOMETRY (ball-follower assignment)
     #
-    # When cat_dist is unavailable: still crawl backward at slow constant
-    # speed (same idea as ball follower's "no depth" branch). Angular
-    # control keeps cat centered while we creep toward it.
+    # Mapping (cf. ball follower):
+    #   error           = ball_col - img_width/2     (negative when on left)
+    #   angular.z       = -error / 300               (turn TOWARD ball)
+    #   linear.x > 0    = forward (toward ball)
+    #
+    # Here cat_cx is normalized [0..1], so error = cat_cx - 0.5.
+    #   cat_cx > 0.5 -> cat on RIGHT -> turn right -> angular.z NEGATIVE
+    #   cat_cx < 0.5 -> cat on LEFT  -> turn left  -> angular.z POSITIVE
+    # i.e. angular.z = -KP * (cat_cx - 0.5)
+    #
+    # Distance:
+    #   dist > target -> too far  -> drive FORWARD  (linear.x > 0)
+    #   dist < target -> too close -> drive BACKWARD (linear.x < 0)
+    # No depth: crawl forward at FOLLOW_NO_DEPTH_SPEED.
     # ──────────────────────────────────────────────────────────────────
 
     def _enter_follow(self):
@@ -553,61 +575,58 @@ class SeekCat(Node):
 
         twist = Twist()
 
-        # ─── Angular control: keep cat centered ──────────────────────
-        # Rear-camera: positive cx error -> cat on robot's LEFT -> turn LEFT
+        # ─── Angular control: keep cat centered (forward-cam) ─────────
+        # cat_cx > 0.5 => cat on the right => turn right => angular.z < 0
         cx_error = self.cat_cx - 0.5
-        twist.angular.z = FOLLOW_KP_ANG * cx_error
+        twist.angular.z = -FOLLOW_KP_ANG * cx_error
         if twist.angular.z >  ANGULAR_SPEED: twist.angular.z =  ANGULAR_SPEED
         if twist.angular.z < -ANGULAR_SPEED: twist.angular.z = -ANGULAR_SPEED
 
         # ─── Linear control ──────────────────────────────────────────
         if self.cat_dist is None:
-            # No distance estimate - crawl backward at slow constant speed
-            # (the rear-camera version of the ball follower's
-            # "twist.linear.x = 0.05" no-depth fallback)
-            if self.back_distance < SAFE_DISTANCE:
-                # Don't crawl into a wall behind us
+            # No depth - crawl forward (matches ball-follower fallback)
+            if self.front_distance < SAFE_DISTANCE:
                 twist.linear.x = 0.0
                 self.get_logger().warn(
-                    f'[Follow] cx={self.cat_cx:.2f} no_depth, rear blocked '
-                    f'({self.back_distance:.2f}m) - turning only',
+                    f'[Follow] cx={self.cat_cx:.2f} no_depth, front blocked '
+                    f'({self.front_distance:.2f}m) - turning only',
                     throttle_duration_sec=1.0)
             else:
-                twist.linear.x = -FOLLOW_NO_DEPTH_SPEED   # backward = toward cat
+                twist.linear.x = +FOLLOW_NO_DEPTH_SPEED   # FORWARD = toward cat
                 self.get_logger().info(
-                    f'[Follow] cx={self.cat_cx:.2f} no_depth - crawling back '
+                    f'[Follow] cx={self.cat_cx:.2f} no_depth - crawling fwd '
                     f'lin={twist.linear.x:+.2f} ang={twist.angular.z:+.2f}',
                     throttle_duration_sec=1.0)
             self.cmd_pub.publish(twist)
             return
 
-        # Have a distance estimate - use P-control toward FOLLOW_DIST_TARGET
+        # Have a distance estimate - P-control toward FOLLOW_DIST_TARGET
         dist       = self.cat_dist
         dist_error = dist - FOLLOW_DIST_TARGET    # +ve = too far, -ve = too close
 
         if dist_error > FOLLOW_TOLERANCE:
-            # Too far - chase by driving BACKWARD (rear-camera)
-            if self.back_distance < SAFE_DISTANCE:
-                self.get_logger().warn(
-                    f'[Follow] Too far ({dist:.2f}m) but rear blocked '
-                    f'({self.back_distance:.2f}m) - turning only',
-                    throttle_duration_sec=1.0)
-                twist.linear.x = 0.0
-            else:
-                speed = min(FOLLOW_SPEED_MAX, FOLLOW_KP_LIN * dist_error)
-                twist.linear.x = -speed   # NEGATIVE = backward = toward cat
-
-        elif dist_error < -FOLLOW_TOLERANCE:
-            # Too close - retreat by driving FORWARD
+            # Too far - chase by driving FORWARD
             if self.front_distance < SAFE_DISTANCE:
                 self.get_logger().warn(
-                    f'[Follow] Too close ({dist:.2f}m) but front blocked '
+                    f'[Follow] Too far ({dist:.2f}m) but front blocked '
                     f'({self.front_distance:.2f}m) - turning only',
                     throttle_duration_sec=1.0)
                 twist.linear.x = 0.0
             else:
+                speed = min(FOLLOW_SPEED_MAX, FOLLOW_KP_LIN * dist_error)
+                twist.linear.x = +speed   # POSITIVE = forward = toward cat
+
+        elif dist_error < -FOLLOW_TOLERANCE:
+            # Too close - back away by driving BACKWARD
+            if self.back_distance < SAFE_DISTANCE:
+                self.get_logger().warn(
+                    f'[Follow] Too close ({dist:.2f}m) but rear blocked '
+                    f'({self.back_distance:.2f}m) - turning only',
+                    throttle_duration_sec=1.0)
+                twist.linear.x = 0.0
+            else:
                 speed = min(FOLLOW_SPEED_MAX, FOLLOW_KP_LIN * abs(dist_error))
-                twist.linear.x = +speed   # POSITIVE = forward = away from cat
+                twist.linear.x = -speed   # NEGATIVE = backward = away from cat
 
         else:
             # Sweet spot - hold position (still center with angular)
