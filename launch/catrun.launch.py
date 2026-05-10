@@ -5,12 +5,17 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
 import os
 
+
 def generate_launch_description():
     nav2_bringup_dir = get_package_share_directory("nav2_bringup")
     map_file = os.path.join(
         get_package_share_directory("catrun"), "map", "my_map.yaml")
 
     return LaunchDescription([
+
+        # ─── t=0s: TF tree ────────────────────────────────────────────────
+        # Static transforms — must be up before anything else subscribes
+        # to TF, so Nav2's costmaps can resolve frames immediately.
 
         # TF base_link -> laser
         Node(
@@ -19,6 +24,7 @@ def generate_launch_description():
             name="base_link_to_laser",
             arguments=["0", "0", "0.19", "3.14159", "0", "0",
                        "base_link", "laser"],
+            output="screen",
         ),
 
         # TF base_link -> base_footprint
@@ -28,9 +34,11 @@ def generate_launch_description():
             name="base_link_to_base_footprint",
             arguments=["0", "0", "0", "0", "0", "0",
                        "base_link", "base_footprint"],
+            output="screen",
         ),
 
-        # RPLiDAR C1
+        # ─── t=0s: RPLiDAR ────────────────────────────────────────────────
+        # Starts immediately so /scan is publishing before rf2o subscribes.
         Node(
             package="rplidar_ros",
             executable="rplidar_composition",
@@ -45,23 +53,33 @@ def generate_launch_description():
             output="screen",
         ),
 
-        # rf2o laser odometry
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(
-                    get_package_share_directory("rf2o_laser_odometry"),
-                    "launch", "rf2o_laser_odometry.launch.py")
-            ),
+        # ─── t=3s: rf2o laser odometry ────────────────────────────────────
+        # Delayed so /scan is alive first; otherwise rf2o spams
+        # "Waiting for laser_scans..." until LiDAR comes up.
+        TimerAction(
+            period=3.0,
+            actions=[
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(
+                            get_package_share_directory("rf2o_laser_odometry"),
+                            "launch", "rf2o_laser_odometry.launch.py")
+                    ),
+                ),
+            ]
         ),
 
-        # Nav2 + AMCL + map (delayed 5s)
+        # ─── t=8s: Localization (map_server + amcl) ───────────────────────
+        # Started FIRST so the `map` frame is being published BEFORE
+        # the navigation stack's costmaps try to look it up.
+        # This is the fix for controller_server hanging in inactive [2].
         TimerAction(
-            period=5.0,
+            period=8.0,
             actions=[
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(
                         os.path.join(nav2_bringup_dir, "launch",
-                                     "bringup_launch.py")
+                                     "localization_launch.py")
                     ),
                     launch_arguments={
                         "map":          map_file,
@@ -71,9 +89,13 @@ def generate_launch_description():
             ]
         ),
 
-        # Set initial pose (delayed 15s)
+        # ─── t=14s: Set initial pose ──────────────────────────────────────
+        # Done AFTER localization is up so AMCL has somewhere to put the
+        # pose. Done BEFORE navigation starts so by the time the costmap
+        # configures, AMCL is publishing map->odom and the `map` frame
+        # is resolvable in TF.
         TimerAction(
-            period=15.0,
+            period=14.0,
             actions=[
                 Node(
                     package="catrun",
@@ -84,4 +106,22 @@ def generate_launch_description():
             ]
         ),
 
+        # ─── t=18s: Navigation (planner, controller, bt_navigator, etc.) ─
+        # By now: TF tree complete, /scan flowing, /odom flowing,
+        # map_server active, amcl active, initial pose set, `map` frame
+        # being published in TF. Costmaps configure cleanly.
+        TimerAction(
+            period=18.0,
+            actions=[
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(
+                        os.path.join(nav2_bringup_dir, "launch",
+                                     "navigation_launch.py")
+                    ),
+                    launch_arguments={
+                        "use_sim_time": "false",
+                    }.items(),
+                ),
+            ]
+        ),
     ])
