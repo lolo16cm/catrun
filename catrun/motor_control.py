@@ -6,6 +6,8 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 import Jetson.GPIO as GPIO
 import os
+import sys
+import signal
 import time
 import math
 
@@ -17,6 +19,7 @@ IN4 = 33
 
 SAFE_DISTANCE = 0.05
 SLOW_DISTANCE = 0.08
+
 
 class MotorControlNode(Node):
 
@@ -155,17 +158,60 @@ class MotorControlNode(Node):
             self.stop()
 
     def destroy_node(self):
-        self.stop()
-        GPIO.cleanup()
+        # Stop motors but DON'T call GPIO.cleanup() here —
+        # that's handled in main()'s finally block to avoid double-cleanup
+        try:
+            self.stop()
+        except Exception:
+            pass
         super().destroy_node()
+
+
+def _safe_cleanup(node):
+    """Stop motors and release GPIO pins. Safe to call multiple times."""
+    if node is not None:
+        try:
+            node.stop()
+        except Exception:
+            pass
+    try:
+        GPIO.cleanup()
+    except Exception:
+        pass
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MotorControlNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    node = None
+
+    # Handle SIGTERM (kill <pid>, systemd stop) — convert to clean exit
+    def _sigterm_handler(signum, frame):
+        _safe_cleanup(node)
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    try:
+        node = MotorControlNode()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        # Ctrl+C — normal shutdown path
+        pass
+    except Exception as e:
+        print(f"[motor_control] error: {e}", file=sys.stderr)
+    finally:
+        # ALWAYS run cleanup, regardless of how we exited spin()
+        _safe_cleanup(node)
+        if node is not None:
+            try:
+                Node.destroy_node(node)
+            except Exception:
+                pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+        print("[motor_control] clean shutdown complete")
+
 
 if __name__ == '__main__':
     main()

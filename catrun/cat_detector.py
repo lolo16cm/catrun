@@ -4,16 +4,17 @@ cat_detector.py
 Runs YOLOv8 + MobileNetV2 to identify cats (eevee / pichu / raichu).
 
 Detection is triggered two ways:
-  1. /camera_check_trigger  — from seek_cat when LiDAR sees a cat-sized moving object
-  2. Every ALWAYS_ON_INTERVAL seconds — fallback for still/hidden cats
+  1. /camera_check_trigger  - from seek_cat when LiDAR sees a cat-sized moving object
+  2. Every ALWAYS_ON_INTERVAL seconds - fallback for still/hidden cats
 
 Publishes:
-  /cat_identity   (std_msgs/String)       — confirmed cat name
-  /cat_position   (geometry_msgs/PointStamped) — normalised [0,1] cx in frame
-  /cat_detection/image (sensor_msgs/Image) — annotated frame for web_stream
+  /cat_identity   (std_msgs/String)       - confirmed cat name
+  /cat_position   (geometry_msgs/PointStamped) - normalised [0,1] cx in frame
+  /cat_detection/image (sensor_msgs/Image) - annotated frame for web_stream
 """
 
 import os
+import sys
 import time
 import threading
 
@@ -33,15 +34,14 @@ from geometry_msgs.msg import PointStamped
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 
-# ── config ────────────────────────────────────────────────────────────────────
-YOLO_MODEL_PATH   = 'yolov8n.pt'
-MOBILENET_MODEL   = os.path.expanduser('~/cat_ws/models/cat_classifier.pth')
-CAT_CLASSES       = ['eevee', 'pichu', 'raichu']
-YOLO_CAT_CLASS_ID = 15          # COCO class id for 'cat'
-YOLO_CONF_THRESH  = 0.5
-MN_CONF_THRESH    = 0.70
-ALWAYS_ON_INTERVAL = 0.1        # NEW - run every frame - was ALWAYS_ON_INTERVAL = 8.0 - Too slow
-# ─────────────────────────────────────────────────────────────────────────────
+# config
+YOLO_MODEL_PATH    = 'yolov8n.pt'
+MOBILENET_MODEL    = os.path.expanduser('~/cat_ws/models/cat_classifier.pth')
+CAT_CLASSES        = ['eevee', 'pichu', 'raichu']
+YOLO_CAT_CLASS_ID  = 15          # COCO class id for 'cat'
+YOLO_CONF_THRESH   = 0.5
+MN_CONF_THRESH     = 0.70
+ALWAYS_ON_INTERVAL = 0.1
 
 TRANSFORM = T.Compose([
     T.Resize((224, 224)),
@@ -56,7 +56,7 @@ class CatDetector(Node):
     def __init__(self):
         super().__init__('cat_detector')
 
-        # ── models ────────────────────────────────────────────────────────────
+        # models
         self.get_logger().info('Loading YOLOv8...')
         self.yolo = YOLO(YOLO_MODEL_PATH)
         self.yolo.to('cpu')
@@ -64,37 +64,29 @@ class CatDetector(Node):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.classifier = self._load_classifier()
 
-        # ── state ─────────────────────────────────────────────────────────────
-        self.bridge       = CvBridge()
-        self.target_cat   = None          # 'eevee' | 'pichu' | 'raichu' | None
-        self.latest_frame = None          # most recent BGR frame
-        self.frame_lock   = threading.Lock()
-        self.triggered    = False         # flag set by trigger callback
-        self.last_run     = 0.0           # wall-clock time of last detection run
-        self.frame_count  = 0
+        # state
+        self.bridge          = CvBridge()
+        self.target_cat      = None
+        self.latest_frame    = None
+        self.frame_lock      = threading.Lock()
+        self.triggered       = False
+        self.last_run        = 0.0
+        self.frame_count     = 0
         self.detection_count = 0
 
-        # ── subscribers ───────────────────────────────────────────────────────
-        # Raw camera frames (always flowing)
-        self.create_subscription(
-            Image, '/camera/catrun', self.image_cb, 10)
+        # subscribers
+        self.create_subscription(Image,  '/camera/catrun',          self.image_cb,   10)
+        self.create_subscription(String, '/cat_target',             self.target_cb,  10)
+        self.create_subscription(String, '/camera_check_trigger',   self.trigger_cb, 10)
 
-        # Target cat from web_stream UI or seek_cat
-        self.create_subscription(
-            String, '/cat_target', self.target_cb, 10)
-
-        # LiDAR motion trigger from seek_cat
-        self.create_subscription(
-            String, '/camera_check_trigger', self.trigger_cb, 10)
-
-        # ── publishers ────────────────────────────────────────────────────────
+        # publishers
         self.pub_position  = self.create_publisher(PointStamped, '/cat_position',        10)
         self.pub_identity  = self.create_publisher(String,       '/cat_identity',         10)
         self.pub_annotated = self.create_publisher(Image,        '/cat_detection/image',  10)
 
-        # ── timers ────────────────────────────────────────────────────────────
-        self.create_timer(0.05,  self.detection_loop)   # NEW - faster detection loop - was 0.01 - 10 Hz — checks if run needed
-        self.create_timer(3.0,  self.status_cb)        # periodic status log
+        # timers
+        self.create_timer(0.05, self.detection_loop)
+        self.create_timer(3.0,  self.status_cb)
 
         self.get_logger().info('=' * 45)
         self.get_logger().info('CatDetector ready!')
@@ -102,8 +94,6 @@ class CatDetector(Node):
         self.get_logger().info(f'  Device  : {self.device}')
         self.get_logger().info(f'  Trigger : /camera_check_trigger')
         self.get_logger().info('=' * 45)
-
-    # ── model loader ──────────────────────────────────────────────────────────
 
     def _load_classifier(self):
         if not os.path.exists(MOBILENET_MODEL):
@@ -122,8 +112,7 @@ class CatDetector(Node):
         self.get_logger().info(f'MobileNetV2 ready! Classes: {CAT_CLASSES}')
         return m
 
-    # ── callbacks ─────────────────────────────────────────────────────────────
-
+    # callbacks
     def target_cb(self, msg: String):
         text = msg.data.strip().lower()
         for name in CAT_CLASSES:
@@ -135,13 +124,11 @@ class CatDetector(Node):
         self.get_logger().info('Target cleared.')
 
     def trigger_cb(self, msg: String):
-        """Called by seek_cat when LiDAR sees a cat-sized moving object."""
         self.get_logger().debug(
             f'[trigger] Camera check requested for: {msg.data}')
         self.triggered = True
 
     def image_cb(self, msg: Image):
-        """Store latest frame — does NOT run detection here."""
         self.frame_count += 1
         if self.frame_count == 1:
             self.get_logger().info(
@@ -153,20 +140,13 @@ class CatDetector(Node):
         except Exception as e:
             self.get_logger().error(f'cv_bridge error: {e}')
 
-    # ── detection loop ────────────────────────────────────────────────────────
-
+    # detection loop
     def detection_loop(self):
-        """
-        Runs at 10 Hz. Only executes YOLO when:
-          - triggered by LiDAR motion signal, OR
-          - ALWAYS_ON_INTERVAL seconds have passed (still cat fallback)
-        """
         now = time.time()
         should_run = (
             self.triggered or
             (now - self.last_run) >= ALWAYS_ON_INTERVAL
         )
-
         if not should_run:
             return
 
@@ -180,15 +160,13 @@ class CatDetector(Node):
         self.last_run  = now
         self._run_detection(frame)
 
-    # ── detection pipeline ────────────────────────────────────────────────────
-
     def _run_detection(self, frame: np.ndarray):
         h, w = frame.shape[:2]
         annotated = frame.copy()
         cat_found = False
 
         try:
-            results = self.yolo(frame, verbose=False, stream=True, imgsz=320) # Added stream=True, imgsz=320
+            results = self.yolo(frame, verbose=False, stream=True, imgsz=320)
         except Exception as e:
             self.get_logger().error(f'YOLO error: {e}')
             return
@@ -205,15 +183,12 @@ class CatDetector(Node):
                 x1 = max(0, x1); y1 = max(0, y1)
                 x2 = min(w, x2); y2 = min(h, y2)
 
-                # Stage 2: identity classification
                 if self.classifier is not None:
                     cat_name, id_conf = self._classify(frame[y1:y2, x1:x2])
                 else:
                     cat_name, id_conf = 'cat', conf
 
-                # Filter by target if one is set
                 if self.target_cat and cat_name != self.target_cat:
-                    # Draw grey box for non-target cats
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), (100, 100, 100), 2)
                     cv2.putText(annotated, f'{cat_name} (not target)',
                                 (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
@@ -229,10 +204,8 @@ class CatDetector(Node):
                     f'CAT FOUND: {cat_name} conf={id_conf:.2f} '
                     f'cx={cx_norm:.2f} cy={cy_norm:.2f}')
 
-                # Publish identity
                 self.pub_identity.publish(String(data=cat_name))
 
-                # Publish normalised position
                 pt = PointStamped()
                 pt.header.stamp    = self.get_clock().now().to_msg()
                 pt.header.frame_id = 'camera'
@@ -241,14 +214,12 @@ class CatDetector(Node):
                 pt.point.z = 0.0
                 self.pub_position.publish(pt)
 
-                # Annotate frame
                 color = (0, 255, 100)
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
                 label = f'{cat_name} {id_conf:.2f}'
                 cv2.putText(annotated, label, (x1, y1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # Publish annotated frame for web_stream
         try:
             img_msg = self.bridge.cv2_to_imgmsg(annotated, 'bgr8')
             img_msg.header.stamp = self.get_clock().now().to_msg()
@@ -258,8 +229,6 @@ class CatDetector(Node):
 
         if not cat_found:
             self.get_logger().debug('No target cat in frame.')
-
-    # ── MobileNetV2 classifier ────────────────────────────────────────────────
 
     def _classify(self, crop_bgr: np.ndarray):
         if crop_bgr.size == 0:
@@ -279,8 +248,6 @@ class CatDetector(Node):
 
         return CAT_CLASSES[idx], conf
 
-    # ── status ────────────────────────────────────────────────────────────────
-
     def status_cb(self):
         if self.frame_count == 0:
             self.get_logger().warn(
@@ -293,16 +260,55 @@ class CatDetector(Node):
                 f'classifier={"ON" if self.classifier else "OFF (YOLO only)"}')
 
 
+def _safe_cleanup(node):
+    """Release ML models, OpenCV windows, and CUDA memory."""
+    if node is not None:
+        try:
+            if hasattr(node, 'classifier') and node.classifier is not None:
+                del node.classifier
+                node.classifier = None
+        except Exception:
+            pass
+        try:
+            if hasattr(node, 'yolo') and node.yolo is not None:
+                del node.yolo
+                node.yolo = None
+        except Exception:
+            pass
+    try:
+        cv2.destroyAllWindows()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def main(args=None):
     rclpy.init(args=args)
-    node = CatDetector()
+    node = None
+
     try:
+        node = CatDetector()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"[cat_detector] error: {e}", file=sys.stderr)
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        _safe_cleanup(node)
+        if node is not None:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+        print("[cat_detector] clean shutdown complete")
 
 
 if __name__ == '__main__':
