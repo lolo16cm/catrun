@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
 """
-flee_behavior.py - PLAY MODE
-============================
-Cat-mice mimic: the robot is the "mouse". It uses the REAR USB camera
-(/dev/video1) to watch behind itself. When the cat detector confirms a
-cat behind, the robot RUNS AWAY (forward) and tries to keep the cat
-behind it (so the rear camera keeps the cat in view).
+flee_behavior.py - PLAY MODE (smart-direction flee)
+===================================================
+Cat-style behavior using a single front CSI camera and the LiDAR.
+No Nav2, no map - purely reactive with smart decisions.
 
-Geometry (REAR camera, inverted goal vs. seek_cat):
-  * Camera faces backward (+X axis of base_link points away from camera).
-  * cat_cx > 0.5 -> cat is on the camera-right = robot's LEFT.
-                    To keep cat centered behind us we'd turn LEFT, but our
-                    goal is to FLEE: we want the cat to STAY behind, so we
-                    just turn slightly to keep it from drifting out of the
-                    rear field of view. Turn LEFT (positive angular.z).
-                    -> angular.z = +KP * (cat_cx - 0.5)   (rear-cam sign)
-  * Distance:
-      Closer than FLEE_PANIC_DIST -> RUN (max forward speed)
-      Closer than FLEE_TARGET_DIST -> flee at speed proportional to
-                                      how close the cat is
-      Farther than FLEE_TARGET_DIST -> walk slowly forward (taunt)
-      No depth -> constant flee speed
+  - Sit still and watch (ambush). If a cat appears, pick the BEST
+    escape direction by scoring all sectors around the robot, then
+    sprint that way for ~2.5m.
+  - After fleeing, stop briefly and check. If cat still nearby, flee
+    again (different direction). If clear, go back to ambush.
+  - After several boring ambushes with no cat, wander a bit to find
+    one (slow LiDAR-based forward + turn-at-walls).
 
-When the cat hasn't been seen for FLEE_LOST_TIMEOUT seconds, the robot
-stops (cat is gone, the game is over). It does NOT try to navigate
-anywhere - this node is purely reactive. Pair it with motor_control.py's
-LiDAR obstacle avoidance to keep it from running into walls.
+State machine
+-------------
+  IDLE         : motors off, no target
+  WAIT_AMBUSH  : stationary, scanning camera, 20s timer
+  FLEE_TURN    : rotating in place to chosen escape angle
+  FLEE_RUN     : sprinting forward; ends on distance/obstacle/cat
+  SCAN_AFTER   : stopped, 2s look-around with camera
+  SEEK_CAT     : LiDAR-based wander while scanning camera (no Nav2)
+  AVOID        : sidestep obstacle, resume previous state
+  DONE         : 'stop' received, motors off
+
+Smart escape-direction scoring (no fixed pattern)
+-------------------------------------------------
+On each FLEE_TURN entry we evaluate 8 sectors covering 360 degrees:
+  score(sector) =   1.0 * angular_dist_from_cat   (further from cat = better)
+                  + 0.5 * sector_clearance_norm   (more open space = better)
+                  - 1.0 * recently_used_penalty   (avoid same way twice)
+The highest-scoring sector becomes the flee direction.
 """
 
 import math
 import sys
 import signal
 import time
+import collections
 
 import rclpy
 from rclpy.node import Node
@@ -39,37 +45,62 @@ from geometry_msgs.msg import PointStamped, Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
-# ─── tunables ────────────────────────────────────────────────────────────
-KNOWN_CATS = {'eevee', 'raichu', 'pichu'}
 
-# Speeds
-FLEE_MAX_SPEED        = 0.30   # m/s, top forward speed when panicking
-FLEE_CRUISE_SPEED     = 0.18   # m/s, when cat is at target distance
-FLEE_TAUNT_SPEED      = 0.06   # m/s, when cat is far - slow forward "tease"
-FLEE_NO_DEPTH_SPEED   = 0.15   # m/s, when distance unknown
-ANGULAR_MAX           = 0.6    # rad/s, max turning rate
+# ─── Camera FOV (front CSI) ──────────────────────────────────────────────
+CAMERA_HFOV_DEG = 63.0
+CAMERA_HFOV_RAD = math.radians(CAMERA_HFOV_DEG)
 
-# Distances
-FLEE_PANIC_DIST   = 0.50   # cat closer than this -> max speed
-FLEE_TARGET_DIST  = 1.20   # try to keep cat at least this far behind
-FLEE_TAUNT_DIST   = 2.00   # cat farther than this -> slow taunt
+# ─── Speeds ──────────────────────────────────────────────────────────────
+ANGULAR_SPEED        = 0.4    # rad/s for turning
+FLEE_LINEAR_SPEED    = 0.18   # m/s flee sprint speed (faster than seek)
+SEEK_LINEAR_SPEED    = 0.10   # m/s seek-mode wander speed
+SEEK_TURN_SPEED      = 0.4    # rad/s when wall-avoiding during seek
 
-# Steering
-FLEE_KP_ANG       = 1.2    # gain on cx error
+# ─── Ambush ──────────────────────────────────────────────────────────────
+AMBUSH_DURATION_SEC  = 20.0   # how long to sit still and watch
+AMBUSH_CYCLES_BEFORE_SEEK = 1 # do this many ambushes before going to seek
 
-# Timeouts
-FLEE_LOST_TIMEOUT = 3.0    # cat unseen this long -> stop
-TRIGGER_PERIOD    = 0.4    # how often to nudge the cat detector
+# ─── Flee ────────────────────────────────────────────────────────────────
+FLEE_TARGET_DIST_M   = 2.5    # sprint until we've fled this far
+FLEE_MAX_DURATION_S  = 8.0    # safety cap on flee time
+FLEE_TURN_TOLERANCE  = math.radians(15.0)  # close enough to target heading
+RECENTLY_USED_SECTORS = 2     # remember this many recent flee directions
 
-# Obstacle safety (we're going forward fast, watch ahead)
-SAFE_FRONT_DIST   = 0.30   # bail out if something this close ahead
-SLOW_FRONT_DIST   = 0.60   # cap speed if something this close ahead
-SAFE_SIDE_DIST    = 0.20
+# ─── Scan after flee ─────────────────────────────────────────────────────
+SCAN_AFTER_SEC       = 2.0
+SCAN_AFTER_CAT_TIMEOUT = 1.5  # cat sighting older than this = "no cat"
 
-# states
-IDLE     = 'IDLE'
-WAITING  = 'WAITING'    # active but no cat seen yet (just hold still)
-FLEEING  = 'FLEEING'    # cat seen behind - run!
+# ─── Seek (cat-hunting wander) ───────────────────────────────────────────
+SEEK_DURATION_SEC    = 30.0   # max time spent seeking before back to ambush
+
+# ─── Obstacle avoidance ──────────────────────────────────────────────────
+SAFE_DISTANCE        = 0.30   # block forward motion when this close
+AVOID_DISTANCE       = 0.40   # need this clear before resuming
+AVOID_MIN_DURATION   = 1.5
+LIDAR_MIN_RANGE      = 0.20   # filter chassis self-occlusion
+
+# ─── Sector layout ───────────────────────────────────────────────────────
+NUM_SECTORS          = 8      # 45 deg each
+
+
+# ─── States ──────────────────────────────────────────────────────────────
+IDLE        = 'IDLE'
+WAIT_AMBUSH = 'WAIT_AMBUSH'
+FLEE_TURN   = 'FLEE_TURN'
+FLEE_RUN    = 'FLEE_RUN'
+SCAN_AFTER  = 'SCAN_AFTER'
+SEEK_CAT    = 'SEEK_CAT'
+AVOID       = 'AVOID'
+DONE        = 'DONE'
+
+
+def normalize_angle(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def angular_distance(a1, a2):
+    """Smallest unsigned distance between two angles, [0, pi]."""
+    return abs(normalize_angle(a1 - a2))
 
 
 class FleeBehavior(Node):
@@ -77,20 +108,49 @@ class FleeBehavior(Node):
     def __init__(self):
         super().__init__('flee_behavior')
 
-        self.state      = IDLE
-        self.target_cat = None
-        self.active     = False
+        # ─── State ────────────────────────────────────────────────────
+        self.state            = IDLE
+        self.active           = False
+        self.ambush_start     = None
+        self.ambush_cycles    = 0
+        self.flee_start       = None
+        self.flee_target_yaw  = None
+        self.flee_origin_x    = 0.0   # not strictly needed without odom; used optionally
+        self.flee_dist_traveled = 0.0
+        self.scan_after_start = None
+        self.seek_start       = None
 
-        self.cat_cx    = None
-        self.cat_dist  = None
-        self.last_seen = None
+        # Cat sighting (front camera)
+        self.cat_cx     = None
+        self.cat_dist   = None
+        self.last_seen  = None   # rclpy Time
 
-        self.front_distance = float('inf')
-        self.left_distance  = float('inf')
-        self.right_distance = float('inf')
+        # Robot heading (estimated from yaw integration of /cmd_vel since
+        # we have no encoders). For relative heading targets only.
+        self.estimated_yaw = 0.0
+        self.last_yaw_update_t = None
+
+        # LiDAR sectors (filled per scan)
+        self.sector_clearance = [float('inf')] * NUM_SECTORS
+        self.front_distance   = float('inf')
+        self.front_left_dist  = float('inf')
+        self.front_right_dist = float('inf')
+        self.back_distance    = float('inf')
+
+        # Recent flee sector history
+        self.recent_sectors = collections.deque(maxlen=RECENTLY_USED_SECTORS)
+
+        # Avoid
+        self.avoid_turn_dir  = 1
+        self.avoid_start     = None
+        self.pre_avoid_state = WAIT_AMBUSH
+
+        # SEEK turn tracking
+        self.seek_turn_until = None
 
         self.last_trigger_time = 0.0
 
+        # ─── ROS interface ────────────────────────────────────────────
         self.create_subscription(String,       '/cat_target',   self._cb_target,   10)
         self.create_subscription(String,       '/cat_identity', self._cb_identity, 10)
         self.create_subscription(PointStamped, '/cat_position', self._cb_position, 10)
@@ -98,16 +158,12 @@ class FleeBehavior(Node):
 
         self.cmd_pub    = self.create_publisher(Twist,  '/cmd_vel',              10)
         self.cam_pub    = self.create_publisher(String, '/camera_check_trigger', 10)
+        self.target_pub = self.create_publisher(String, '/cat_target',           10)
         self.status_pub = self.create_publisher(String, '/seek_status',          10)
 
         self.create_timer(0.1, self._loop)
-
-        self.get_logger().info('=' * 50)
-        self.get_logger().info('FleeBehavior ready - PLAY MODE (rear camera)')
-        self.get_logger().info(f'  panic<{FLEE_PANIC_DIST}m  '
-                               f'target={FLEE_TARGET_DIST}m  '
-                               f'taunt>{FLEE_TAUNT_DIST}m')
-        self.get_logger().info('=' * 50)
+        self.get_logger().info(
+            'FleeBehavior ready - smart-direction flee (no Nav2)')
 
     # ─── Callbacks ────────────────────────────────────────────────────
     def _cb_target(self, msg: String):
@@ -115,157 +171,437 @@ class FleeBehavior(Node):
         if text in ('', 'stop', 'none'):
             self._reset()
             return
-        # Play mode flees from ANY cat - accept any non-empty target.
-        # We still record the requested name for log readability, but
-        # we don't filter detections against it.
-        self.target_cat = text if text in KNOWN_CATS else 'any'
-        self.active     = True
-        self.state      = WAITING
-        self.cat_cx     = None
-        self.cat_dist   = None
-        self.last_seen  = None
-        self.get_logger().info(
-            f'Play mode armed (requested: {text}) - any cat triggers flee')
-        self._publish_status(f'fleeing from any cat (requested: {text})')
+        # Play mode: any non-stop string means "be in play mode"
+        self.active           = True
+        self.ambush_cycles    = 0
+        self.cat_cx           = None
+        self.cat_dist         = None
+        self.last_seen        = None
+        self.estimated_yaw    = 0.0
+        self.recent_sectors.clear()
+        self._enter_wait_ambush()
+        self.get_logger().info(f'Play mode active (target={text})')
 
     def _cb_identity(self, msg: String):
-        # Any cat identity triggers - we don't filter by name in play mode.
-        # This callback is just for logging the first sighting.
-        name = msg.data.strip().lower()
-        if not self.active:
-            return
-        if self.state == WAITING:
-            self.get_logger().info(f"Spotted '{name}' behind us - fleeing!")
+        # Unused - we react to /cat_position which already implies a cat
+        pass
 
     def _cb_position(self, msg: PointStamped):
         self.cat_cx    = msg.point.x
         self.cat_dist  = msg.point.z if msg.point.z > 0.05 else None
         self.last_seen = self.get_clock().now()
-        if self.state == WAITING:
-            self.state = FLEEING
+
+        # If we're sitting in ambush, scanning, or seeking and a cat
+        # arrives, react immediately.
+        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT):
+            self.get_logger().info(
+                f'[/cat_position] cx={self.cat_cx:.2f} '
+                f'dist={"n/a" if self.cat_dist is None else f"{self.cat_dist:.2f}m"} '
+                f'(state={self.state}) -> FLEE')
+            self._enter_flee_turn()
+        elif self.state == FLEE_RUN:
+            # Cat reappears mid-flee - cut short and re-decide
+            self.get_logger().info(
+                '[/cat_position] cat reappeared during FLEE_RUN - re-deciding')
+            self._enter_flee_turn()
 
     def _cb_scan(self, msg: LaserScan):
-        ranges = msg.ranges
-        n      = len(ranges)
+        ranges  = msg.ranges
+        n       = len(ranges)
+        eff_min = max(msg.range_min, LIDAR_MIN_RANGE)
+        rmax    = msg.range_max
+        amin    = msg.angle_min
+        ainc    = msg.angle_increment
 
         def safe_min(indices):
             vals = [ranges[i] for i in indices
-                    if msg.range_min < ranges[i] < msg.range_max
+                    if eff_min < ranges[i] < rmax
                     and math.isfinite(ranges[i])]
             return min(vals) if vals else float('inf')
 
-        # Front sector (we're driving forward when fleeing)
-        self.front_distance = safe_min(
+        # Cardinal distances for obstacle checks
+        self.front_distance   = safe_min(
             list(range(0, n//12)) + list(range(11*n//12, n)))
-        self.left_distance  = safe_min(list(range(n//4,    5*n//12)))
-        self.right_distance = safe_min(list(range(7*n//12, 3*n//4)))
+        self.front_left_dist  = safe_min(list(range(n//12, n//4)))
+        self.front_right_dist = safe_min(list(range(3*n//4, 11*n//12)))
+        self.back_distance    = safe_min(list(range(5*n//12, 7*n//12)))
+
+        # Sector clearances (8 sectors of 45 deg)
+        sector_vals = [[] for _ in range(NUM_SECTORS)]
+        sector_size = 2 * math.pi / NUM_SECTORS
+        for i in range(n):
+            r = ranges[i]
+            if not (eff_min < r < rmax) or not math.isfinite(r):
+                continue
+            angle = normalize_angle(amin + i * ainc)
+            # Map to sector index 0..7. Sector 0 is centered on 0 (forward).
+            sec = int(((angle + math.pi) % (2*math.pi)) / sector_size) % NUM_SECTORS
+            sector_vals[sec].append(r)
+
+        for s in range(NUM_SECTORS):
+            self.sector_clearance[s] = (min(sector_vals[s])
+                                        if sector_vals[s] else 0.0)
+
+    # ─── Heading estimation (no encoders) ─────────────────────────────
+    def _update_yaw_from_cmd(self, ang_z):
+        """Integrate angular velocity over time to estimate heading.
+        Crude but adequate for relative turns (we don't need a global
+        heading - just to know we've turned about 90 degrees)."""
+        now = time.time()
+        if self.last_yaw_update_t is not None:
+            dt = now - self.last_yaw_update_t
+            self.estimated_yaw += ang_z * dt
+            self.estimated_yaw = normalize_angle(self.estimated_yaw)
+        self.last_yaw_update_t = now
+
+    # ─── Sector scoring ───────────────────────────────────────────────
+    def _cat_world_angle(self):
+        """Estimate cat's angle in robot frame from cat_cx in image.
+        cat_cx is normalized [0, 1]; 0.5 = center.
+          cat_cx > 0.5 -> cat to the right of camera -> negative angle
+          cat_cx < 0.5 -> cat to the left  of camera -> positive angle
+        """
+        if self.cat_cx is None:
+            return 0.0
+        # Angle in robot frame: front camera looks down +X
+        offset_from_center = (0.5 - self.cat_cx) * CAMERA_HFOV_RAD
+        return offset_from_center
+
+    def _pick_flee_direction(self):
+        """Score every sector, return the angle (rad in robot frame)
+        of the best one to flee toward."""
+        cat_angle = self._cat_world_angle()
+        sector_size = 2 * math.pi / NUM_SECTORS
+
+        # Most-clear sector is the reference for clearance normalization
+        max_clearance = max(self.sector_clearance) or 1.0
+
+        scores = []
+        for s in range(NUM_SECTORS):
+            # Sector center angle in robot frame (forward = 0)
+            sec_angle = -math.pi + (s + 0.5) * sector_size
+
+            ang_dist = angular_distance(sec_angle, cat_angle)  # [0, pi]
+            clearance = self.sector_clearance[s]
+            clearance_norm = clearance / max_clearance         # [0, 1]
+
+            score = (1.0 * ang_dist
+                     + 0.5 * clearance_norm * math.pi)         # scale to ~ pi
+
+            # Heavy penalty for unsafe directions
+            if clearance < SAFE_DISTANCE * 1.5:
+                score -= 5.0
+
+            # Avoid running same way twice in a row
+            if s in self.recent_sectors:
+                score -= 1.0
+
+            scores.append((score, s, sec_angle, clearance, ang_dist))
+
+        # Sort by score desc and pick the best
+        scores.sort(key=lambda x: -x[0])
+        best_score, best_sec, best_angle, best_clear, best_angdist = scores[0]
+        self.recent_sectors.append(best_sec)
+
+        self.get_logger().info(
+            f'[Flee] Picked sector {best_sec} '
+            f'(angle={math.degrees(best_angle):+.0f}deg, '
+            f'clear={best_clear:.2f}m, '
+            f'angdist_from_cat={math.degrees(best_angdist):.0f}deg, '
+            f'score={best_score:.2f})')
+        return best_angle
 
     # ─── Main loop ────────────────────────────────────────────────────
     def _loop(self):
-        if not self.active or self.target_cat is None:
+        if not self.active:
             return
 
-        # Nudge the detector to keep producing
-        self._trigger_camera()
-
-        if self.state == WAITING:
-            # Cat hasn't been spotted yet - hold still and look behind
-            self._stop_motors()
-            return
-
-        if self.state == FLEEING:
-            self._loop_flee()
-
-    def _loop_flee(self):
-        now = self.get_clock().now()
-
-        # Check whether we've lost the cat
-        if self.last_seen is not None:
-            elapsed = (now - self.last_seen).nanoseconds / 1e9
-            if elapsed > FLEE_LOST_TIMEOUT:
-                self.get_logger().info(
-                    '[Flee] Cat out of sight - holding position '
-                    '(escape successful?)')
-                self._stop_motors()
-                self.state    = WAITING
-                self.cat_cx   = None
-                self.cat_dist = None
+        # Hard obstacle override (does NOT apply during turning - we may
+        # need to turn even if there's something in front of us)
+        if self.state in (FLEE_RUN, SEEK_CAT):
+            if self.front_distance < SAFE_DISTANCE:
+                self.get_logger().warn(
+                    f'[{self.state}] Front blocked '
+                    f'({self.front_distance:.2f}m) -> AVOID')
+                self._enter_avoid()
                 return
 
-        if self.cat_cx is None:
-            self._stop_motors()
+        # Trigger camera detector while we want to see cats
+        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT):
+            self._trigger_camera()
+
+        if self.state == WAIT_AMBUSH:
+            self._loop_wait_ambush()
+        elif self.state == FLEE_TURN:
+            self._loop_flee_turn()
+        elif self.state == FLEE_RUN:
+            self._loop_flee_run()
+        elif self.state == SCAN_AFTER:
+            self._loop_scan_after()
+        elif self.state == SEEK_CAT:
+            self._loop_seek_cat()
+        elif self.state == AVOID:
+            self._loop_avoid()
+
+    # ─── WAIT_AMBUSH ──────────────────────────────────────────────────
+    def _enter_wait_ambush(self):
+        self.state = WAIT_AMBUSH
+        self.ambush_start = time.time()
+        self._stop_motors()
+        self._publish_status('ambushing')
+        self.get_logger().info(
+            f'[Ambush] Sitting still {AMBUSH_DURATION_SEC}s, watching for cats')
+
+    def _loop_wait_ambush(self):
+        elapsed = time.time() - self.ambush_start
+        self._stop_motors()
+
+        if int(elapsed) % 5 == 0 and elapsed - int(elapsed) < 0.11:
+            self.get_logger().info(
+                f'[Ambush] {elapsed:.0f}/{AMBUSH_DURATION_SEC:.0f}s '
+                f'(cycle {self.ambush_cycles+1})')
+
+        if elapsed >= AMBUSH_DURATION_SEC:
+            self.ambush_cycles += 1
+            if self.ambush_cycles >= AMBUSH_CYCLES_BEFORE_SEEK:
+                self.get_logger().info(
+                    f'[Ambush] {self.ambush_cycles} ambushes done '
+                    f'-> SEEK_CAT')
+                self._enter_seek_cat()
+            else:
+                self._enter_wait_ambush()   # restart the ambush timer
+
+    # ─── FLEE_TURN ────────────────────────────────────────────────────
+    def _enter_flee_turn(self):
+        # Pick best direction, set as target
+        target_angle = self._pick_flee_direction()
+        # Convert to absolute target heading
+        self.flee_target_yaw = normalize_angle(
+            self.estimated_yaw + target_angle)
+        self.state = FLEE_TURN
+        self.flee_start = time.time()
+        self._stop_motors()
+        self._publish_status('fleeing')
+        self.get_logger().info(
+            f'[Flee] Turning to relative angle '
+            f'{math.degrees(target_angle):+.0f}deg '
+            f'(target_yaw={math.degrees(self.flee_target_yaw):+.0f}deg)')
+
+    def _loop_flee_turn(self):
+        # Compute yaw error
+        yaw_err = normalize_angle(self.flee_target_yaw - self.estimated_yaw)
+
+        if abs(yaw_err) < FLEE_TURN_TOLERANCE:
+            self.get_logger().info(
+                f'[Flee] Turn complete (err={math.degrees(yaw_err):+.0f}deg) '
+                f'-> FLEE_RUN')
+            self._enter_flee_run()
+            return
+
+        # Safety: if we've been turning too long, give up and start running
+        if time.time() - self.flee_start > 4.0:
+            self.get_logger().warn(
+                f'[Flee] Turn timed out (err still '
+                f'{math.degrees(yaw_err):+.0f}deg) - running anyway')
+            self._enter_flee_run()
+            return
+
+        # Turn toward target
+        twist = Twist()
+        twist.angular.z = ANGULAR_SPEED if yaw_err > 0 else -ANGULAR_SPEED
+        self.cmd_pub.publish(twist)
+        self._update_yaw_from_cmd(twist.angular.z)
+
+    # ─── FLEE_RUN ─────────────────────────────────────────────────────
+    def _enter_flee_run(self):
+        self.state = FLEE_RUN
+        self.flee_start = time.time()
+        self.flee_dist_traveled = 0.0
+        self._publish_status('fleeing')
+
+    def _loop_flee_run(self):
+        elapsed = time.time() - self.flee_start
+
+        # Track distance via integration of commanded velocity (no
+        # encoders, so this is approximate but adequate)
+        self.flee_dist_traveled += FLEE_LINEAR_SPEED * 0.1
+
+        # End conditions
+        if self.flee_dist_traveled >= FLEE_TARGET_DIST_M:
+            self.get_logger().info(
+                f'[Flee] Reached {FLEE_TARGET_DIST_M}m -> SCAN_AFTER')
+            self._enter_scan_after()
+            return
+        if elapsed > FLEE_MAX_DURATION_S:
+            self.get_logger().info(
+                f'[Flee] Max time {FLEE_MAX_DURATION_S}s -> SCAN_AFTER')
+            self._enter_scan_after()
+            return
+
+        # Drive forward
+        twist = Twist()
+        twist.linear.x = FLEE_LINEAR_SPEED
+        # Slight drift toward the more open side to keep flowing through
+        if self.front_left_dist > self.front_right_dist + 0.3:
+            twist.angular.z = +0.08
+        elif self.front_right_dist > self.front_left_dist + 0.3:
+            twist.angular.z = -0.08
+        self.cmd_pub.publish(twist)
+        self._update_yaw_from_cmd(twist.angular.z)
+
+        self.get_logger().info(
+            f'[Flee-run] t={elapsed:.1f}s d~{self.flee_dist_traveled:.2f}m '
+            f'front={self.front_distance:.2f}',
+            throttle_duration_sec=1.0)
+
+    # ─── SCAN_AFTER ───────────────────────────────────────────────────
+    def _enter_scan_after(self):
+        self.state = SCAN_AFTER
+        self.scan_after_start = time.time()
+        self._stop_motors()
+        self._publish_status('checking')
+        self.get_logger().info(
+            f'[Scan] Stopped, looking around for {SCAN_AFTER_SEC}s')
+
+    def _loop_scan_after(self):
+        elapsed = time.time() - self.scan_after_start
+        self._stop_motors()
+        self._trigger_camera()
+
+        # Cat re-detected during scan?  _cb_position would re-enter FLEE_TURN
+        # so this only fires when no cat is seen.
+        if elapsed >= SCAN_AFTER_SEC:
+            # Check freshness of last sighting; if recent, FLEE; else AMBUSH
+            now = self.get_clock().now()
+            if self.last_seen is not None:
+                age = (now - self.last_seen).nanoseconds / 1e9
+                if age < SCAN_AFTER_CAT_TIMEOUT:
+                    self.get_logger().info(
+                        f'[Scan] Cat sighting still fresh ({age:.1f}s) '
+                        f'-> FLEE again')
+                    self._enter_flee_turn()
+                    return
+            self.get_logger().info(
+                '[Scan] All clear -> WAIT_AMBUSH')
+            self._enter_wait_ambush()
+
+    # ─── SEEK_CAT (LiDAR-based wander, no Nav2) ───────────────────────
+    def _enter_seek_cat(self):
+        self.state = SEEK_CAT
+        self.seek_start = time.time()
+        self.seek_turn_until = None
+        self._publish_status('seeking')
+        self.get_logger().info(
+            f'[Seek] Wandering to find a cat (max {SEEK_DURATION_SEC}s)')
+
+    def _loop_seek_cat(self):
+        elapsed = time.time() - self.seek_start
+        if elapsed > SEEK_DURATION_SEC:
+            self.get_logger().info(
+                f'[Seek] Timed out after {SEEK_DURATION_SEC}s '
+                f'-> back to WAIT_AMBUSH')
+            self.ambush_cycles = 0
+            self._enter_wait_ambush()
             return
 
         twist = Twist()
+        # If currently turning to escape a wall, keep turning until done
+        now = time.time()
+        if self.seek_turn_until is not None and now < self.seek_turn_until:
+            # Determine direction (set when we entered the turn)
+            twist.angular.z = self._seek_turn_direction * SEEK_TURN_SPEED
+            self.cmd_pub.publish(twist)
+            self._update_yaw_from_cmd(twist.angular.z)
+            return
 
-        # ─── Angular: keep cat centered in REAR camera ────────────────
-        # Rear-cam: cat_cx > 0.5 means cat appears on the camera-right,
-        # which is the robot's LEFT side. To re-center the cat in the
-        # rear view we need to turn LEFT.  Turning LEFT = positive
-        # angular.z. So: angular.z = +KP * (cat_cx - 0.5).
-        # (This is the OPPOSITE sign from the forward-camera ball
-        # follower, which is correct for a rear-facing cam.)
-        cx_error = self.cat_cx - 0.5
-        ang = +FLEE_KP_ANG * cx_error
-        twist.angular.z = max(-ANGULAR_MAX, min(ANGULAR_MAX, ang))
+        if self.front_distance < SAFE_DISTANCE * 1.4:
+            # Wall ahead - turn to the more open side for ~1 second
+            self._seek_turn_direction = (+1 if self.front_left_dist
+                                              > self.front_right_dist else -1)
+            self.seek_turn_until = now + 1.0
+            twist.angular.z = self._seek_turn_direction * SEEK_TURN_SPEED
+            self.cmd_pub.publish(twist)
+            self._update_yaw_from_cmd(twist.angular.z)
+            return
 
-        # ─── Linear: run AWAY from cat ────────────────────────────────
-        # Rear camera looks behind, robot's forward (+X) is away from cat,
-        # so to flee we drive linear.x > 0 (forward).
-        if self.cat_dist is None:
-            base_speed = FLEE_NO_DEPTH_SPEED
-        elif self.cat_dist < FLEE_PANIC_DIST:
-            # Cat is right on us - panic!
-            base_speed = FLEE_MAX_SPEED
-        elif self.cat_dist < FLEE_TARGET_DIST:
-            # Cat is closing in - flee proportional to how close
-            t = ((FLEE_TARGET_DIST - self.cat_dist)
-                 / max(0.01, FLEE_TARGET_DIST - FLEE_PANIC_DIST))
-            base_speed = FLEE_CRUISE_SPEED + t * (FLEE_MAX_SPEED - FLEE_CRUISE_SPEED)
-        elif self.cat_dist < FLEE_TAUNT_DIST:
-            # Cat at comfortable distance - cruise
-            base_speed = FLEE_CRUISE_SPEED
-        else:
-            # Cat is way back - taunt slowly so it keeps coming
-            base_speed = FLEE_TAUNT_SPEED
-
-        # Cap speed if there's something close ahead
-        if self.front_distance < SAFE_FRONT_DIST:
-            self.get_logger().warn(
-                f'[Flee] Front blocked ({self.front_distance:.2f}m) - '
-                f'turning only',
-                throttle_duration_sec=1.0)
-            twist.linear.x = 0.0
-            # Bias the turn AWAY from the closer side wall
-            if self.left_distance < SAFE_SIDE_DIST:
-                twist.angular.z = -ANGULAR_MAX
-            elif self.right_distance < SAFE_SIDE_DIST:
-                twist.angular.z = +ANGULAR_MAX
-        elif self.front_distance < SLOW_FRONT_DIST:
-            # Scale speed down linearly between SAFE and SLOW
-            scale = ((self.front_distance - SAFE_FRONT_DIST)
-                     / max(0.01, SLOW_FRONT_DIST - SAFE_FRONT_DIST))
-            twist.linear.x = base_speed * scale
-        else:
-            twist.linear.x = base_speed
-
+        # Otherwise just drive forward, drift toward more open side
+        self.seek_turn_until = None
+        twist.linear.x = SEEK_LINEAR_SPEED
+        if self.front_left_dist > self.front_right_dist + 0.3:
+            twist.angular.z = +0.1
+        elif self.front_right_dist > self.front_left_dist + 0.3:
+            twist.angular.z = -0.1
         self.cmd_pub.publish(twist)
+        self._update_yaw_from_cmd(twist.angular.z)
 
-        dist_str = f'{self.cat_dist:.2f}m' if self.cat_dist is not None else 'n/a'
         self.get_logger().info(
-            f'[Flee] cx={self.cat_cx:.2f} cat_dist={dist_str} '
-            f'lin={twist.linear.x:+.2f} ang={twist.angular.z:+.2f} '
-            f'(front={self.front_distance:.2f})',
-            throttle_duration_sec=0.5)
+            f'[Seek] t={elapsed:.0f}s lin={twist.linear.x:.2f} '
+            f'ang={twist.angular.z:+.2f} front={self.front_distance:.2f}',
+            throttle_duration_sec=2.0)
+
+    # ─── AVOID ────────────────────────────────────────────────────────
+    def _enter_avoid(self):
+        self.pre_avoid_state = self.state
+        self.state           = AVOID
+        self.avoid_start     = time.time()
+        self._stop_motors()
+
+        if self.front_right_dist > self.front_left_dist:
+            self.avoid_turn_dir = -1
+        else:
+            self.avoid_turn_dir = 1
+
+        self.get_logger().info(
+            f'[Avoid] front={self.front_distance:.2f}m -> '
+            f'{"LEFT" if self.avoid_turn_dir > 0 else "RIGHT"} '
+            f'(was {self.pre_avoid_state})')
+
+    def _loop_avoid(self):
+        elapsed = time.time() - self.avoid_start
+
+        if elapsed < AVOID_MIN_DURATION:
+            twist = Twist()
+            twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED
+            if elapsed > 0.8:
+                twist.linear.x = -0.05   # slight back-up while turning
+            self.cmd_pub.publish(twist)
+            self._update_yaw_from_cmd(twist.angular.z)
+            return
+
+        if self.front_distance > AVOID_DISTANCE:
+            self._stop_motors()
+            self.get_logger().info(f'[Avoid] Clear -> resume {self.pre_avoid_state}')
+            if self.pre_avoid_state == FLEE_RUN:
+                # Restart flee timer so we still sprint full duration
+                self.flee_start = time.time()
+                self.state = FLEE_RUN
+            elif self.pre_avoid_state == SEEK_CAT:
+                self.state = SEEK_CAT
+                self.seek_turn_until = None
+            elif self.pre_avoid_state == WAIT_AMBUSH:
+                self._enter_wait_ambush()
+            else:
+                self.state = self.pre_avoid_state
+            return
+
+        if elapsed < AVOID_MIN_DURATION * 2.5:
+            twist = Twist()
+            twist.angular.z = self.avoid_turn_dir * ANGULAR_SPEED
+            self.cmd_pub.publish(twist)
+            self._update_yaw_from_cmd(twist.angular.z)
+        else:
+            self.avoid_turn_dir = -self.avoid_turn_dir
+            self.avoid_start = time.time()
+            self.get_logger().warn('[Avoid] Still stuck - flipping direction')
 
     # ─── Helpers ──────────────────────────────────────────────────────
     def _trigger_camera(self):
         now = time.time()
-        if now - self.last_trigger_time < TRIGGER_PERIOD:
+        if now - self.last_trigger_time < 0.4:
             return
         self.last_trigger_time = now
         msg = String()
-        msg.data = self.target_cat or 'any'
+        msg.data = 'any'
         self.cam_pub.publish(msg)
 
     def _stop_motors(self):
@@ -276,12 +612,18 @@ class FleeBehavior(Node):
 
     def _reset(self):
         self._stop_motors()
-        self.state      = IDLE
-        self.active     = False
-        self.target_cat = None
-        self.cat_cx     = None
-        self.cat_dist   = None
-        self.last_seen  = None
+        self.state             = IDLE
+        self.active            = False
+        self.cat_cx            = None
+        self.cat_dist          = None
+        self.last_seen         = None
+        self.flee_start        = None
+        self.flee_target_yaw   = None
+        self.scan_after_start  = None
+        self.seek_start        = None
+        self.ambush_start      = None
+        self.ambush_cycles     = 0
+        self.recent_sectors.clear()
         self._publish_status('stopped')
 
 

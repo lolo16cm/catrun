@@ -8,9 +8,9 @@ Now supports TWO modes via the `mode` launch argument:
   ros2 launch catrun catrun.launch.py mode:=play
 
   watch : front CSI camera + cat_detector(watch) + seek_cat
-          (robot navigates waypoints, finds cat, follows forward)
-  play  : rear  USB camera + cat_detector(play)  + flee_behavior
-          (robot waits for cat to appear behind, then runs away)
+          (robot wanders, finds cat, follows like ball-follower)
+  play  : front CSI camera + cat_detector(play)  + flee_behavior
+          (robot ambushes, sees cat, smart-direction flee)
 
 Order of operations (unchanged):
   t=0s   TF (base_link -> laser, base_link -> base_footprint)
@@ -168,16 +168,20 @@ def _build_actions(context, *args, **kwargs):
             output='screen',
         )
     else:  # play
+        # PLAY MODE: single front CSI camera, smart-direction flee.
+        # The rear USB camera was unreliable; using the front camera
+        # only is simpler and more stable. The robot flees forward
+        # (camera looks where it's running), and stops to scan after.
         camera_params = {
-            'camera_source': 'usb1',
-            'device_path':   '/dev/video1',
+            'camera_source': 'csi0',
+            'flip_method':   2,
             'width':         640,
-            'height':        480,
-            'framerate':     30,
+            'height':        360,
+            'framerate':     15,
         }
         detector_params = {
             'mode':     'play',
-            'focal_px': REAR_FOCAL_PX,
+            'focal_px': FRONT_FOCAL_PX,
         }
         behavior_node = Node(
             package='catrun',
