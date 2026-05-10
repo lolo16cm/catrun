@@ -53,6 +53,11 @@ FOLLOW_SPEED_MAX      = 0.20
 FOLLOW_KP_LIN         = 0.4
 FOLLOW_KP_ANG         = 1.5
 LOST_TIMEOUT          = 5.0
+# Hard front-distance stop: if anything is closer than this in front of
+# us, we NEVER drive forward, regardless of where the cat is (the cat
+# might be on the other side of a wall, or the bbox-distance estimate
+# might be wrong). This is a safety floor that overrides P-control.
+FOLLOW_FRONT_HARD_STOP = 0.50   # m
 # Constant slow forward crawl when no distance estimate is available
 # (matches the assignment's `twist.linear.x = 0.05` no-depth fallback).
 FOLLOW_NO_DEPTH_SPEED = 0.05   # m/s, forward toward cat
@@ -307,12 +312,26 @@ class SeekCat(Node):
         if not self.active or self.target_cat is None:
             return
 
-        if self.state not in (FOLLOW, AVOID, IDLE, DONE):
-            if self.front_distance < SAFE_DISTANCE:
-                self.get_logger().warn(
-                    f'Obstacle {self.front_distance:.2f}m!')
-                self._enter_avoid()
-                return
+        # Obstacle check: NAVIGATE/CHECK/YOLO_WAIT use a tight SAFE_DISTANCE
+        # threshold. FOLLOW uses the wider FOLLOW_FRONT_HARD_STOP so the
+        # robot side-steps walls instead of plowing into them while
+        # chasing a cat (or chasing a cat that's behind a wall).
+        if self.state not in (AVOID, IDLE, DONE):
+            if self.state == FOLLOW:
+                # Only enter AVOID when really close - cats can be in
+                # tight spaces and we don't want to bail too eagerly.
+                if self.front_distance < SAFE_DISTANCE:
+                    self.get_logger().warn(
+                        f'[Follow] Wall hit ({self.front_distance:.2f}m) - '
+                        f'avoiding!')
+                    self._enter_avoid()
+                    return
+            else:
+                if self.front_distance < SAFE_DISTANCE:
+                    self.get_logger().warn(
+                        f'Obstacle {self.front_distance:.2f}m!')
+                    self._enter_avoid()
+                    return
 
         if self.state in (NAVIGATE, CHECK_OBJ, YOLO_WAIT):
             self._trigger_camera()
@@ -584,12 +603,16 @@ class SeekCat(Node):
 
         # ─── Linear control ──────────────────────────────────────────
         if self.cat_dist is None:
-            # No depth - crawl forward (matches ball-follower fallback)
-            if self.front_distance < SAFE_DISTANCE:
+            # No depth estimate. Crawl forward only if there's clearly
+            # space ahead; otherwise just turn to keep the cat centered.
+            # This prevents creeping right up to the cat or into a wall
+            # that happens to have the cat on the far side.
+            if self.front_distance < FOLLOW_FRONT_HARD_STOP:
                 twist.linear.x = 0.0
                 self.get_logger().warn(
-                    f'[Follow] cx={self.cat_cx:.2f} no_depth, front blocked '
-                    f'({self.front_distance:.2f}m) - turning only',
+                    f'[Follow] cx={self.cat_cx:.2f} no_depth, front '
+                    f'{self.front_distance:.2f}m < {FOLLOW_FRONT_HARD_STOP}m '
+                    f'- holding (turn only)',
                     throttle_duration_sec=1.0)
             else:
                 twist.linear.x = +FOLLOW_NO_DEPTH_SPEED   # FORWARD = toward cat
@@ -605,11 +628,15 @@ class SeekCat(Node):
         dist_error = dist - FOLLOW_DIST_TARGET    # +ve = too far, -ve = too close
 
         if dist_error > FOLLOW_TOLERANCE:
-            # Too far - chase by driving FORWARD
-            if self.front_distance < SAFE_DISTANCE:
+            # Too far - chase by driving FORWARD, but only if there's
+            # actually room ahead. If something's closer than the hard
+            # stop, we just turn to stay aimed at the cat and let the
+            # main _loop's obstacle check trigger AVOID if it gets worse.
+            if self.front_distance < FOLLOW_FRONT_HARD_STOP:
                 self.get_logger().warn(
-                    f'[Follow] Too far ({dist:.2f}m) but front blocked '
-                    f'({self.front_distance:.2f}m) - turning only',
+                    f'[Follow] Too far ({dist:.2f}m) but front '
+                    f'{self.front_distance:.2f}m < {FOLLOW_FRONT_HARD_STOP}m '
+                    f'- holding (turn only)',
                     throttle_duration_sec=1.0)
                 twist.linear.x = 0.0
             else:
@@ -648,6 +675,9 @@ class SeekCat(Node):
                 f'but Nav2 is active - letting Nav2 handle it')
             return
 
+        # Remember whether we were following so we can resume FOLLOW
+        # rather than restarting waypoint navigation if the cat is still
+        # in view after we side-step.
         self.pre_avoid_state = self.state
         self.state           = AVOID
         self.avoid_start     = time.time()
@@ -663,7 +693,8 @@ class SeekCat(Node):
 
         self.get_logger().info(
             f'[Avoid] front={self.front_distance:.2f}m '
-            f'-> {"LEFT" if self.avoid_turn_dir > 0 else "RIGHT"}')
+            f'-> {"LEFT" if self.avoid_turn_dir > 0 else "RIGHT"} '
+            f'(was {self.pre_avoid_state})')
 
     def _loop_avoid(self):
         elapsed = time.time() - self.avoid_start
@@ -679,11 +710,23 @@ class SeekCat(Node):
             return
 
         if self.front_distance > AVOID_DISTANCE:
-            self.get_logger().info('[Avoid] Clear - resuming')
             self._stop_motors()
-            self.nav_sent    = False
-            self.nav_arrived = False
-            self.state       = NAVIGATE
+            # Resume whatever we were doing. If we were following and
+            # the cat sighting is still fresh, go straight back to
+            # FOLLOW; otherwise resume waypoint navigation.
+            now = self.get_clock().now()
+            cat_fresh = (self.last_seen is not None and
+                         (now - self.last_seen).nanoseconds / 1e9 < LOST_TIMEOUT)
+            if self.pre_avoid_state == FOLLOW and cat_fresh:
+                self.get_logger().info(
+                    '[Avoid] Clear - resuming FOLLOW')
+                self.state = FOLLOW
+            else:
+                self.get_logger().info(
+                    '[Avoid] Clear - resuming navigation')
+                self.nav_sent    = False
+                self.nav_arrived = False
+                self.state       = NAVIGATE
             return
 
         if elapsed < AVOID_MIN_DURATION * 2:
