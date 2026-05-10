@@ -76,6 +76,12 @@ OBJECT_PERSIST_COUNT = 5
 SAFE_DISTANCE        = 0.25
 AVOID_DISTANCE       = 0.35
 AVOID_MIN_DURATION   = 3.0
+# LiDAR self-occlusion filter: anything closer than this is ignored as
+# a sensor reading (it's almost certainly the robot's own chassis or a
+# bracket protruding into the LiDAR's view, not a real obstacle). The
+# RPLiDAR C1's actual minimum sensing range is well above this; readings
+# of 11-13 cm in our scans are reliably self-occlusion.
+LIDAR_MIN_RANGE      = 0.20
 
 # Search
 MAX_SEARCH_CYCLES   = 3
@@ -215,9 +221,14 @@ class SeekCat(Node):
         ranges = msg.ranges
         n      = len(ranges)
 
+        # Effective minimum: max of msg's reported range_min and our
+        # self-occlusion filter. The RPLiDAR can return values from
+        # ~10 cm but anything below 20 cm in our setup is the chassis.
+        eff_min = max(msg.range_min, LIDAR_MIN_RANGE)
+
         def safe_min(indices):
             vals = [ranges[i] for i in indices
-                    if msg.range_min < ranges[i] < msg.range_max
+                    if eff_min < ranges[i] < msg.range_max
                     and math.isfinite(ranges[i])]
             return min(vals) if vals else float('inf')
 
@@ -235,7 +246,7 @@ class SeekCat(Node):
             i_start = max(0, int(s * CAMERA_HFOV_RAD / msg.angle_increment))
             i_end   = min(n-1, int((s+1) * CAMERA_HFOV_RAD / msg.angle_increment))
             sector_vals = [ranges[i] for i in range(i_start, i_end+1)
-                           if msg.range_min < ranges[i] < msg.range_max
+                           if eff_min < ranges[i] < msg.range_max
                            and math.isfinite(ranges[i])]
             if sector_vals and min(sector_vals) > SAFE_DISTANCE:
                 center = msg.angle_min + (s + 0.5) * CAMERA_HFOV_RAD
@@ -255,9 +266,9 @@ class SeekCat(Node):
         for i in range(min(n, len(prev_ranges))):
             r_now  = ranges[i]
             r_prev = prev_ranges[i]
-            if not (msg.range_min < r_now < min(msg.range_max, CAT_DIST_MAX)):
+            if not (eff_min < r_now < min(msg.range_max, CAT_DIST_MAX)):
                 continue
-            if not (msg.range_min < r_prev < min(msg.range_max, CAT_DIST_MAX)):
+            if not (eff_min < r_prev < min(msg.range_max, CAT_DIST_MAX)):
                 continue
             if abs(r_now - r_prev) > MOTION_DIST_THRESH:
                 angle = msg.angle_min + i * msg.angle_increment
