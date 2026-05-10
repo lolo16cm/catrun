@@ -73,6 +73,15 @@ SCAN_AFTER_CAT_TIMEOUT = 1.5  # cat sighting older than this = "no cat"
 # ─── Seek (cat-hunting wander) ───────────────────────────────────────────
 SEEK_DURATION_SEC    = 30.0   # max time spent seeking before back to ambush
 
+# ─── Confirm (stop & verify before fleeing) ──────────────────────────────
+# When YOLO publishes /cat_position, robot stops and watches for a moment
+# to make sure it really is a cat (not a fluke). Need at least
+# CONFIRM_FLEE_HITS additional position updates during the hold to commit
+# to the flee. If only the original sighting and nothing else arrives,
+# we treat it as a false alarm and resume what we were doing.
+CONFIRM_FLEE_HOLD_SEC  = 1.5   # how long to stop and watch
+CONFIRM_FLEE_HITS      = 2     # need this many MORE sightings during hold
+
 # ─── Obstacle avoidance ──────────────────────────────────────────────────
 SAFE_DISTANCE        = 0.30   # block forward motion when this close
 AVOID_DISTANCE       = 0.40   # need this clear before resuming
@@ -84,14 +93,15 @@ NUM_SECTORS          = 8      # 45 deg each
 
 
 # ─── States ──────────────────────────────────────────────────────────────
-IDLE        = 'IDLE'
-WAIT_AMBUSH = 'WAIT_AMBUSH'
-FLEE_TURN   = 'FLEE_TURN'
-FLEE_RUN    = 'FLEE_RUN'
-SCAN_AFTER  = 'SCAN_AFTER'
-SEEK_CAT    = 'SEEK_CAT'
-AVOID       = 'AVOID'
-DONE        = 'DONE'
+IDLE          = 'IDLE'
+WAIT_AMBUSH   = 'WAIT_AMBUSH'
+CONFIRM_FLEE  = 'CONFIRM_FLEE'   # stopped, watching to verify cat is real
+FLEE_TURN     = 'FLEE_TURN'
+FLEE_RUN      = 'FLEE_RUN'
+SCAN_AFTER    = 'SCAN_AFTER'
+SEEK_CAT      = 'SEEK_CAT'
+AVOID         = 'AVOID'
+DONE          = 'DONE'
 
 
 def normalize_angle(a):
@@ -123,7 +133,13 @@ class FleeBehavior(Node):
         # Cat sighting (front camera)
         self.cat_cx     = None
         self.cat_dist   = None
+        self.cat_camera = 'front'   # 'front' or 'rear' - which camera saw it
         self.last_seen  = None   # rclpy Time
+
+        # Confirmation hold state
+        self.confirm_start = None
+        self.confirm_hits  = 0
+        self.confirm_camera = 'front'  # which camera triggered the confirmation
 
         # Robot heading (estimated from yaw integration of /cmd_vel since
         # we have no encoders). For relative heading targets only.
@@ -191,19 +207,38 @@ class FleeBehavior(Node):
         self.cat_dist  = msg.point.z if msg.point.z > 0.05 else None
         self.last_seen = self.get_clock().now()
 
-        # If we're sitting in ambush, scanning, or seeking and a cat
-        # arrives, react immediately.
+        # Parse which camera saw the cat from frame_id
+        # ('camera_front' or 'camera_rear')
+        fid = msg.header.frame_id or ''
+        if fid.endswith('rear'):
+            self.cat_camera = 'rear'
+        else:
+            self.cat_camera = 'front'
+
+        # If we're idle (ambush/scan/seek), STOP and confirm rather than
+        # snap-react. Sneaky false positives have caused the robot to
+        # flee for nothing - the confirm hold filters those out.
         if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT):
             self.get_logger().info(
                 f'[/cat_position] cx={self.cat_cx:.2f} '
                 f'dist={"n/a" if self.cat_dist is None else f"{self.cat_dist:.2f}m"} '
-                f'(state={self.state}) -> FLEE')
-            self._enter_flee_turn()
+                f'cam={self.cat_camera} (state={self.state}) -> CONFIRM_FLEE')
+            self._enter_confirm_flee(initial_camera=self.cat_camera)
+        elif self.state == CONFIRM_FLEE:
+            # Count this as a hit during the confirm hold
+            self.confirm_hits += 1
+            # If the camera that just saw the cat differs from the one
+            # that triggered the confirm, track that too - means the
+            # cat may have moved past us.
+            if self.cat_camera != self.confirm_camera:
+                self.get_logger().info(
+                    f'[Confirm] Now seen by {self.cat_camera} camera too')
         elif self.state == FLEE_RUN:
             # Cat reappears mid-flee - cut short and re-decide
             self.get_logger().info(
-                '[/cat_position] cat reappeared during FLEE_RUN - re-deciding')
-            self._enter_flee_turn()
+                f'[/cat_position] cat reappeared during FLEE_RUN '
+                f'(cam={self.cat_camera}) - re-deciding')
+            self._enter_confirm_flee(initial_camera=self.cat_camera)
 
     def _cb_scan(self, msg: LaserScan):
         ranges  = msg.ranges
@@ -256,16 +291,34 @@ class FleeBehavior(Node):
 
     # ─── Sector scoring ───────────────────────────────────────────────
     def _cat_world_angle(self):
-        """Estimate cat's angle in robot frame from cat_cx in image.
-        cat_cx is normalized [0, 1]; 0.5 = center.
-          cat_cx > 0.5 -> cat to the right of camera -> negative angle
-          cat_cx < 0.5 -> cat to the left  of camera -> positive angle
+        """Estimate cat's angle in robot frame from cat_cx + camera id.
+
+        The front camera looks down +X (angle 0).
+        The rear  camera looks down -X (angle pi).
+
+        cat_cx is normalized [0, 1]; 0.5 = center of the camera image.
+          cat_cx > 0.5 -> cat to the right of camera -> negative angle in cam frame
+          cat_cx < 0.5 -> cat to the left  of camera -> positive angle in cam frame
+
+        Adjusted for rear camera, the left/right are mirrored vs. the
+        robot's frame (the rear cam looks backward, so its "right" is
+        the robot's "left"). We handle that here.
         """
         if self.cat_cx is None:
             return 0.0
-        # Angle in robot frame: front camera looks down +X
+
+        # Angle within the camera FOV
         offset_from_center = (0.5 - self.cat_cx) * CAMERA_HFOV_RAD
-        return offset_from_center
+
+        if self.cat_camera == 'rear':
+            # Rear camera points at +pi (behind). And because the rear
+            # camera is mirrored relative to the robot body (left side
+            # of rear cam image = robot's right side), the offset flips
+            # sign when we transform into the robot frame.
+            return normalize_angle(math.pi - offset_from_center)
+        else:
+            # Front camera: offset is directly the angle in robot frame
+            return offset_from_center
 
     def _pick_flee_direction(self):
         """Score every sector, return the angle (rad in robot frame)
@@ -327,11 +380,13 @@ class FleeBehavior(Node):
                 return
 
         # Trigger camera detector while we want to see cats
-        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT):
+        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT, CONFIRM_FLEE):
             self._trigger_camera()
 
         if self.state == WAIT_AMBUSH:
             self._loop_wait_ambush()
+        elif self.state == CONFIRM_FLEE:
+            self._loop_confirm_flee()
         elif self.state == FLEE_TURN:
             self._loop_flee_turn()
         elif self.state == FLEE_RUN:
@@ -370,6 +425,45 @@ class FleeBehavior(Node):
                 self._enter_seek_cat()
             else:
                 self._enter_wait_ambush()   # restart the ambush timer
+
+    # ─── CONFIRM_FLEE ─────────────────────────────────────────────────
+    # When the detector first publishes /cat_position, we don't react
+    # instantly. We stop and hold for CONFIRM_FLEE_HOLD_SEC, counting
+    # additional position updates. If we get enough hits in the hold
+    # window, the cat is real and we proceed to FLEE_TURN. Otherwise
+    # it was a fluke and we go back to where we were.
+    def _enter_confirm_flee(self, initial_camera='front'):
+        self.state         = CONFIRM_FLEE
+        self.confirm_start = time.time()
+        self.confirm_hits  = 0          # the initial sighting doesn't count;
+                                        # we want fresh ones during the hold
+        self.confirm_camera = initial_camera
+        self._stop_motors()
+        self._publish_status('confirming')
+        self.get_logger().info(
+            f'[Confirm] Cat sighted by {initial_camera} cam - holding '
+            f'{CONFIRM_FLEE_HOLD_SEC}s to verify')
+
+    def _loop_confirm_flee(self):
+        elapsed = time.time() - self.confirm_start
+        self._stop_motors()
+        self._trigger_camera()
+
+        if elapsed < CONFIRM_FLEE_HOLD_SEC:
+            return
+
+        if self.confirm_hits >= CONFIRM_FLEE_HITS:
+            self.get_logger().info(
+                f'[Confirm] Verified ({self.confirm_hits} extra hits) -> FLEE')
+            self._enter_flee_turn()
+        else:
+            self.get_logger().info(
+                f'[Confirm] Only {self.confirm_hits} extra hits - fluke, '
+                f'resuming WAIT_AMBUSH')
+            self.cat_cx     = None
+            self.cat_dist   = None
+            self.last_seen  = None
+            self._enter_wait_ambush()
 
     # ─── FLEE_TURN ────────────────────────────────────────────────────
     def _enter_flee_turn(self):
@@ -580,6 +674,9 @@ class FleeBehavior(Node):
                 self.seek_turn_until = None
             elif self.pre_avoid_state == WAIT_AMBUSH:
                 self._enter_wait_ambush()
+            elif self.pre_avoid_state == CONFIRM_FLEE:
+                # Restart the confirm hold so we get a full window
+                self._enter_confirm_flee(initial_camera=self.cat_camera)
             else:
                 self.state = self.pre_avoid_state
             return
@@ -616,6 +713,7 @@ class FleeBehavior(Node):
         self.active            = False
         self.cat_cx            = None
         self.cat_dist          = None
+        self.cat_camera        = 'front'
         self.last_seen         = None
         self.flee_start        = None
         self.flee_target_yaw   = None
@@ -623,6 +721,8 @@ class FleeBehavior(Node):
         self.seek_start        = None
         self.ambush_start      = None
         self.ambush_cycles     = 0
+        self.confirm_start     = None
+        self.confirm_hits      = 0
         self.recent_sectors.clear()
         self._publish_status('stopped')
 

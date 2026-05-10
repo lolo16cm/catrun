@@ -321,18 +321,48 @@ class CatDetector(Node):
         now = time.time()
         if not (self.triggered or (now - self.last_run) >= ALWAYS_ON_INTERVAL):
             return
-
-        with self.frame_lock:
-            frame = self.latest_frame
-
-        if frame is None:
-            return
-
         self.triggered = False
         self.last_run  = now
-        self._run_detection(frame)
 
-    def _run_detection(self, frame: np.ndarray):
+        # During "fleeing"/"checking" we only watch the rear camera
+        # (the cat is the threat behind us). In all other states we
+        # watch BOTH cameras - either can spot the threat. This way
+        # the robot reacts to a cat sneaking up from behind during
+        # ambush as well.
+        in_flee = self.latest_status in ('fleeing', 'checking')
+
+        with self.frame_lock:
+            front_frame = self.latest_front_frame
+            rear_frame  = self.latest_rear_frame
+            legacy_frame = self.latest_legacy_frame
+
+        if in_flee:
+            # Only rear feed matters
+            if rear_frame is not None:
+                self._run_detection(rear_frame, camera='rear')
+            elif legacy_frame is not None:
+                self._run_detection(legacy_frame, camera='front')
+        else:
+            # Search states: process BOTH feeds, whichever sees a cat
+            # first triggers the reaction. We alternate which is
+            # processed first on each tick to keep latency symmetric.
+            self._search_tick_parity = getattr(self, '_search_tick_parity', 0) ^ 1
+            if self._search_tick_parity == 0:
+                if front_frame is not None:
+                    self._run_detection(front_frame, camera='front')
+                if rear_frame is not None:
+                    self._run_detection(rear_frame, camera='rear')
+            else:
+                if rear_frame is not None:
+                    self._run_detection(rear_frame, camera='rear')
+                if front_frame is not None:
+                    self._run_detection(front_frame, camera='front')
+            # Fall back to legacy feed if neither dual-cam feed is up
+            if (front_frame is None and rear_frame is None
+                    and legacy_frame is not None):
+                self._run_detection(legacy_frame, camera='front')
+
+    def _run_detection(self, frame: np.ndarray, camera: str = 'front'):
         h, w = frame.shape[:2]
         annotated = frame.copy()
         detected_this_frame = None
@@ -448,7 +478,9 @@ class CatDetector(Node):
 
         pt = PointStamped()
         pt.header.stamp    = self.get_clock().now().to_msg()
-        pt.header.frame_id = 'camera'
+        # Encode the camera that saw the cat in frame_id. flee_behavior
+        # uses this to know whether the cat is in front or behind.
+        pt.header.frame_id = f'camera_{camera}'   # 'camera_front' or 'camera_rear'
         pt.point.x = avg_cx
         pt.point.y = avg_cy
         pt.point.z = avg_dist     # actual distance in meters
