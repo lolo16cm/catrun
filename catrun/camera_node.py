@@ -33,28 +33,38 @@ import cv2
 
 
 def build_csi_pipeline(sensor_id, width, height, framerate, flip_method):
-    """GStreamer pipeline for a CSI camera via nvarguscamerasrc."""
+    """GStreamer pipeline for a CSI camera via nvarguscamerasrc.
+
+    Low-latency tuning:
+      - appsink: max-buffers=1, drop=1, sync=false -> keep only newest
+      - leaky queue between stages so old frames are dropped if a stage stalls
+    """
     return (
         f'nvarguscamerasrc sensor-id={sensor_id} ! '
         f'video/x-raw(memory:NVMM), width={width}, height={height}, '
         f'framerate={framerate}/1 ! '
         f'nvvidconv flip-method={flip_method} ! '
         f'video/x-raw, format=BGRx ! '
+        f'queue leaky=downstream max-size-buffers=1 ! '
         f'videoconvert ! '
         f'video/x-raw, format=BGR ! '
-        f'appsink drop=1'
+        f'appsink drop=1 sync=false max-buffers=1'
     )
 
 
 def build_usb_pipeline(device_path, width, height, framerate):
-    """GStreamer pipeline for a USB / V4L2 camera (e.g. /dev/video1)."""
+    """GStreamer pipeline for a USB / V4L2 camera (e.g. /dev/video1).
+
+    Same low-latency tuning as the CSI pipeline.
+    """
     return (
-        f'v4l2src device={device_path} ! '
+        f'v4l2src device={device_path} io-mode=2 ! '
         f'video/x-raw, width={width}, height={height}, '
         f'framerate={framerate}/1 ! '
+        f'queue leaky=downstream max-size-buffers=1 ! '
         f'videoconvert ! '
         f'video/x-raw, format=BGR ! '
-        f'appsink drop=1'
+        f'appsink drop=1 sync=false max-buffers=1'
     )
 
 
@@ -138,18 +148,41 @@ class CameraNode(Node):
         self.get_logger().info(
             f'Camera opened! Publishing to /camera/catrun ({source})')
 
-        # Publish at half the capture rate to ease CPU on the Orin Nano,
-        # same as your original (30 fps capture -> ~15 fps publish).
-        publish_rate = max(1, framerate // 2)
+        # Force OpenCV's internal buffer to size 1 so cv2.VideoCapture.read()
+        # returns the newest frame instead of an old one from the queue.
+        # This is essential for low latency.
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        # Publish at the same rate the camera produces frames. Publishing
+        # slower than the camera's framerate causes lag because frames
+        # accumulate in the GStreamer/OpenCV buffer between reads.
+        publish_rate = framerate
         self.create_timer(1.0 / publish_rate, self.timer_callback)
+        self._last_publish_warn_t = 0.0
 
     def timer_callback(self):
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
+        # Drain any stale frames from the buffer so we publish the
+        # newest one. With max-buffers=1 in the GStreamer appsink and
+        # CAP_PROP_BUFFERSIZE=1 in OpenCV this should usually be a
+        # single read, but the loop is defensive against driver-level
+        # buffering on USB cameras.
+        latest = None
+        for _ in range(3):
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                latest = frame
+            else:
+                break
+
+        if latest is None:
             self.get_logger().warn('Failed to grab frame',
                                    throttle_duration_sec=2.0)
             return
-        msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
+
+        msg = self.bridge.cv2_to_imgmsg(latest, 'bgr8')
         msg.header.stamp    = self.get_clock().now().to_msg()
         msg.header.frame_id = 'camera'
         self.pub.publish(msg)
