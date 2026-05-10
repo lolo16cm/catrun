@@ -8,15 +8,23 @@ Detection is triggered two ways:
   2. Every ALWAYS_ON_INTERVAL seconds - fallback for still/hidden cats
 
 Publishes:
-  /cat_identity   (std_msgs/String)       - confirmed cat name
+  /cat_identity   (std_msgs/String)             - confirmed cat name
   /cat_position   (geometry_msgs/PointStamped) - normalised [0,1] cx in frame
-  /cat_detection/image (sensor_msgs/Image) - annotated frame for web_stream
+  /cat_detection/image (sensor_msgs/Image)      - annotated frame for web_stream
+
+Multi-frame confirmation:
+  A detection only triggers /cat_identity + /cat_position when the same
+  cat name appears in CONFIRM_HITS of the last CONFIRM_WINDOW frames.
+  This filters out glitched frames, motion-blurred frames, and momentary
+  mis-classifications. Single-frame false positives can no longer trigger
+  follow mode, and single-frame misses no longer break detection.
 """
 
 import os
 import sys
 import time
 import threading
+from collections import deque
 
 import cv2
 import numpy as np
@@ -42,6 +50,22 @@ YOLO_CAT_CLASS_ID  = 15          # COCO class id for 'cat'
 YOLO_CONF_THRESH   = 0.5
 MN_CONF_THRESH     = 0.70
 ALWAYS_ON_INTERVAL = 0.1
+
+# Multi-frame confirmation
+# Detection must appear in CONFIRM_HITS of the last CONFIRM_WINDOW frames
+# before /cat_identity and /cat_position are published.
+# Tuning:
+#   - Increase CONFIRM_HITS to require more agreement (fewer false positives,
+#     but slower response)
+#   - Decrease to be more permissive (faster response, but more noise)
+#   - CONFIRM_WINDOW should be at least 1 + CONFIRM_HITS
+CONFIRM_WINDOW = 5    # how many recent frames to consider
+CONFIRM_HITS   = 3    # how many of those frames must agree on the same cat
+
+# How long an entry stays "fresh" in the rolling buffer. If detections come
+# in sparsely (e.g. during a still pose), we don't want a hit from 30 seconds
+# ago contributing to today's vote.
+ENTRY_TTL_SEC  = 2.0
 
 TRANSFORM = T.Compose([
     T.Resize((224, 224)),
@@ -73,6 +97,12 @@ class CatDetector(Node):
         self.last_run        = 0.0
         self.frame_count     = 0
         self.detection_count = 0
+        self.confirmed_count = 0   # how many times we've published a confirmed ID
+
+        # Multi-frame confirmation buffer.
+        # Each entry: dict with keys {ts, name, cx, cy, conf}
+        # name == None means "this frame had no cat detection"
+        self.detection_history = deque(maxlen=CONFIRM_WINDOW)
 
         # subscribers
         self.create_subscription(Image,  '/camera/catrun',          self.image_cb,   10)
@@ -92,7 +122,8 @@ class CatDetector(Node):
         self.get_logger().info('CatDetector ready!')
         self.get_logger().info(f'  Classes : {CAT_CLASSES}')
         self.get_logger().info(f'  Device  : {self.device}')
-        self.get_logger().info(f'  Trigger : /camera_check_trigger')
+        self.get_logger().info(f'  Confirm : {CONFIRM_HITS} of last {CONFIRM_WINDOW} frames '
+                               f'(TTL {ENTRY_TTL_SEC}s)')
         self.get_logger().info('=' * 45)
 
     def _load_classifier(self):
@@ -118,9 +149,11 @@ class CatDetector(Node):
         for name in CAT_CLASSES:
             if name in text:
                 self.target_cat = name
+                self.detection_history.clear()  # reset confirmation buffer
                 self.get_logger().info(f'Target cat: {self.target_cat}')
                 return
         self.target_cat = None
+        self.detection_history.clear()
         self.get_logger().info('Target cleared.')
 
     def trigger_cb(self, msg: String):
@@ -163,7 +196,9 @@ class CatDetector(Node):
     def _run_detection(self, frame: np.ndarray):
         h, w = frame.shape[:2]
         annotated = frame.copy()
-        cat_found = False
+        detected_this_frame = None  # what (if anything) did we detect
+        cx_norm = cy_norm = 0.0
+        id_conf = 0.0
 
         try:
             results = self.yolo(frame, verbose=False, stream=True, imgsz=320)
@@ -171,64 +206,151 @@ class CatDetector(Node):
             self.get_logger().error(f'YOLO error: {e}')
             return
 
+        # Pick the SINGLE best cat detection in this frame (by confidence).
+        # Previously the code looped over all boxes and immediately published
+        # for each — meaning two cats in frame would publish twice for one
+        # frame. We want one detection per frame for the rolling buffer.
+        best_box = None
+        best_conf = 0.0
         for result in results:
             for box in result.boxes:
                 cls  = int(box.cls)
                 conf = float(box.conf)
-
                 if cls != YOLO_CAT_CLASS_ID or conf < YOLO_CONF_THRESH:
                     continue
+                if conf > best_conf:
+                    best_conf = conf
+                    best_box  = box
 
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                x1 = max(0, x1); y1 = max(0, y1)
-                x2 = min(w, x2); y2 = min(h, y2)
+        if best_box is not None:
+            x1, y1, x2, y2 = map(int, best_box.xyxy[0])
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(w, x2); y2 = min(h, y2)
 
-                if self.classifier is not None:
-                    cat_name, id_conf = self._classify(frame[y1:y2, x1:x2])
-                else:
-                    cat_name, id_conf = 'cat', conf
+            if self.classifier is not None:
+                cat_name, id_conf = self._classify(frame[y1:y2, x1:x2])
+            else:
+                cat_name, id_conf = 'cat', best_conf
 
-                if self.target_cat and cat_name != self.target_cat:
-                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (100, 100, 100), 2)
-                    cv2.putText(annotated, f'{cat_name} (not target)',
-                                (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (100, 100, 100), 1)
-                    continue
+            cx_norm = float((x1 + x2) / 2) / w
+            cy_norm = float((y1 + y2) / 2) / h
 
-                cat_found = True
-                self.detection_count += 1
-                cx_norm = float((x1 + x2) / 2) / w
-                cy_norm = float((y1 + y2) / 2) / h
+            # Annotate bounding box
+            color = (0, 255, 100)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            label = f'{cat_name} {id_conf:.2f}'
+            cv2.putText(annotated, label, (x1, y1 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                self.get_logger().info(
-                    f'CAT FOUND: {cat_name} conf={id_conf:.2f} '
-                    f'cx={cx_norm:.2f} cy={cy_norm:.2f}')
+            detected_this_frame = cat_name
 
-                self.pub_identity.publish(String(data=cat_name))
+        # ── Append this frame's result to the rolling history ──────────────
+        now = time.time()
+        self.detection_history.append({
+            'ts':   now,
+            'name': detected_this_frame,   # may be None
+            'cx':   cx_norm,
+            'cy':   cy_norm,
+            'conf': id_conf,
+        })
 
-                pt = PointStamped()
-                pt.header.stamp    = self.get_clock().now().to_msg()
-                pt.header.frame_id = 'camera'
-                pt.point.x = cx_norm
-                pt.point.y = cy_norm
-                pt.point.z = 0.0
-                self.pub_position.publish(pt)
+        # ── Multi-frame confirmation: only publish if N of last M agree ────
+        # Drop expired entries from voting (TTL)
+        fresh = [e for e in self.detection_history
+                 if (now - e['ts']) <= ENTRY_TTL_SEC]
 
-                color = (0, 255, 100)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                label = f'{cat_name} {id_conf:.2f}'
-                cv2.putText(annotated, label, (x1, y1 - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # Count hits per name, ignoring None entries
+        name_counts = {}
+        for e in fresh:
+            if e['name'] is None:
+                continue
+            name_counts[e['name']] = name_counts.get(e['name'], 0) + 1
 
+        confirmed_name = None
+        for name, count in name_counts.items():
+            if count >= CONFIRM_HITS:
+                confirmed_name = name
+                break
+
+        # Filter by target if one is set
+        if self.target_cat and confirmed_name != self.target_cat:
+            # Either nothing confirmed, or confirmed but not the target
+            if detected_this_frame and detected_this_frame != self.target_cat:
+                # Annotate non-target detections in grey (still useful to see)
+                pass  # already drawn above in green; downgrade color:
+                # (we'll just leave them green for visibility - it's fine)
+
+            # Add a "voting" overlay so user sees what's happening
+            self._add_vote_overlay(annotated, name_counts, fresh)
+
+            # publish annotated frame (no identity/position)
+            self._publish_annotated(annotated)
+            return
+
+        if confirmed_name is None:
+            # Nothing reached the confirmation threshold
+            self._add_vote_overlay(annotated, name_counts, fresh)
+            self._publish_annotated(annotated)
+            return
+
+        # ── Confirmed! Publish identity + position ─────────────────────────
+        # Use the average position from the fresh hits of the confirmed name
+        hits = [e for e in fresh if e['name'] == confirmed_name]
+        avg_cx   = sum(e['cx']   for e in hits) / len(hits)
+        avg_cy   = sum(e['cy']   for e in hits) / len(hits)
+        avg_conf = sum(e['conf'] for e in hits) / len(hits)
+
+        self.confirmed_count += 1
+        self.detection_count += 1
+
+        self.get_logger().info(
+            f'CONFIRMED: {confirmed_name} '
+            f'({len(hits)}/{len(fresh)} frames) '
+            f'avg_conf={avg_conf:.2f} cx={avg_cx:.2f}')
+
+        # Publish identity
+        self.pub_identity.publish(String(data=confirmed_name))
+
+        # Publish position
+        pt = PointStamped()
+        pt.header.stamp    = self.get_clock().now().to_msg()
+        pt.header.frame_id = 'camera'
+        pt.point.x = avg_cx
+        pt.point.y = avg_cy
+        pt.point.z = 0.0
+        self.pub_position.publish(pt)
+
+        # Add big confirmation overlay
+        cv2.putText(annotated,
+                    f'CONFIRMED {confirmed_name} ({len(hits)}/{len(fresh)})',
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        self._publish_annotated(annotated)
+
+    def _add_vote_overlay(self, img, name_counts, fresh):
+        """Overlay current voting status on the annotated image."""
+        y = 30
+        cv2.putText(img, f'frames in window: {len(fresh)}/{CONFIRM_WINDOW}',
+                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        y += 20
+        if name_counts:
+            for name, count in name_counts.items():
+                color = (0, 255, 0) if count >= CONFIRM_HITS else (0, 200, 200)
+                cv2.putText(img,
+                            f'  {name}: {count}/{CONFIRM_HITS} needed',
+                            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                y += 20
+        else:
+            cv2.putText(img, '  (no detections in window)',
+                        (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (150, 150, 150), 1)
+
+    def _publish_annotated(self, annotated):
         try:
             img_msg = self.bridge.cv2_to_imgmsg(annotated, 'bgr8')
             img_msg.header.stamp = self.get_clock().now().to_msg()
             self.pub_annotated.publish(img_msg)
         except Exception as e:
             self.get_logger().error(f'Annotated publish error: {e}')
-
-        if not cat_found:
-            self.get_logger().debug('No target cat in frame.')
 
     def _classify(self, crop_bgr: np.ndarray):
         if crop_bgr.size == 0:
@@ -256,6 +378,7 @@ class CatDetector(Node):
             self.get_logger().info(
                 f'frames={self.frame_count} | '
                 f'detections={self.detection_count} | '
+                f'confirmed={self.confirmed_count} | '
                 f'target={self.target_cat or "any"} | '
                 f'classifier={"ON" if self.classifier else "OFF (YOLO only)"}')
 

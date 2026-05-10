@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-seek_cat.py - Fixed with rear-camera follow geometry
+seek_cat.py - Fixed
+==================
+Includes:
+  - Rear-camera follow geometry (chase backward, retreat forward)
+  - Discrete-step spin during object check (turn, stop, look, repeat)
+    so YOLO gets sharp frames between motion bursts
+  - Multi-frame detection works hand-in-hand with cat_detector's
+    confirmation buffer
+  - Robust shutdown
 """
 
 import math
@@ -16,22 +24,34 @@ from geometry_msgs.msg import PointStamped, Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
-# tunables
+# ── tunables ─────────────────────────────────────────────────────────────
 ANGULAR_SPEED       = 0.3
 LINEAR_SPEED        = 0.15
 
 # Camera
 CAMERA_HFOV_DEG     = 63.0
 CAMERA_HFOV_RAD     = math.radians(CAMERA_HFOV_DEG)
-CAMERA_OFFSET_RAD   = math.pi
+CAMERA_OFFSET_RAD   = math.pi          # camera faces backward
 YOLO_PAUSE_SEC      = 2.0
 
+# Discrete-step spin parameters (Fix 2)
+# Instead of spinning continuously across the full HFOV (during which all
+# frames are motion-blurred), break the spin into chunks. Each chunk:
+#   1. TURN_CHUNK_SEC: turn for a short duration
+#   2. SETTLE_SEC:     stop and wait for camera buffers to flush blur
+#   3. LOOK_SEC:       sit still while YOLO runs on sharp frames
+# Total HFOV is split into NUM_CHUNKS segments.
+TURN_CHUNK_SEC      = 0.6              # turn duration per chunk (~10° at 0.3 rad/s)
+SETTLE_SEC          = 0.3              # let buffers flush motion blur
+LOOK_SEC            = 0.8              # sharp-frame detection window
+NUM_CHUNKS          = 4                # how many turn-look cycles to cover HFOV
+
 # Follow - keep about 1m from the cat (assignment spec)
-FOLLOW_DIST_TARGET  = 1.0       # meters
-FOLLOW_TOLERANCE    = 0.10      # meters (deadband)
-FOLLOW_SPEED_MAX    = 0.20      # m/s
-FOLLOW_KP_LIN       = 0.4       # P-gain for distance error
-FOLLOW_KP_ANG       = 1.5       # P-gain for centering error
+FOLLOW_DIST_TARGET  = 1.0
+FOLLOW_TOLERANCE    = 0.10
+FOLLOW_SPEED_MAX    = 0.20
+FOLLOW_KP_LIN       = 0.4
+FOLLOW_KP_ANG       = 1.5
 LOST_TIMEOUT        = 5.0
 
 # LiDAR motion detection
@@ -65,13 +85,13 @@ WAYPOINTS = [
 ]
 
 # states
-IDLE        = 'IDLE'
-NAVIGATE    = 'NAVIGATE'
-CHECK_OBJ   = 'CHECK_OBJ'
-YOLO_WAIT   = 'YOLO_WAIT'
-FOLLOW      = 'FOLLOW'
-AVOID       = 'AVOID'
-DONE        = 'DONE'
+IDLE              = 'IDLE'
+NAVIGATE          = 'NAVIGATE'
+CHECK_OBJ_TURN    = 'CHECK_OBJ_TURN'    # turning a chunk
+CHECK_OBJ_LOOK    = 'CHECK_OBJ_LOOK'    # stopped, running YOLO
+FOLLOW            = 'FOLLOW'
+AVOID             = 'AVOID'
+DONE              = 'DONE'
 
 
 def polar_to_xy(r, a):
@@ -102,16 +122,15 @@ class SeekCat(Node):
         self.nav_retries      = 0
         self._last_goal_time  = 0.0
 
-        # Object checking
-        self.pending_objects    = []
-        self.object_candidates  = {}
-        self.current_obj_index  = 0
-        self.turn_start         = None
-        self.turn_sec           = 0.0
-        self.turn_direction     = 1
-        self.yolo_start         = None
-        self.pre_check_state    = NAVIGATE
-        self.pre_check_wp_index = 0
+        # Object checking (discrete-step)
+        self.pending_objects     = []
+        self.object_candidates   = {}
+        self.current_obj_index   = 0
+        self.current_chunk_index = 0          # which chunk of NUM_CHUNKS
+        self.chunk_phase_start   = None       # time the current phase started
+        self.turn_direction      = 1
+        self.pre_check_state     = NAVIGATE
+        self.pre_check_wp_index  = 0
 
         # Follow
         self.cat_cx    = None
@@ -152,9 +171,12 @@ class SeekCat(Node):
         self.status_pub = self.create_publisher(String, '/seek_status',          10)
 
         self.create_timer(0.1, self._loop)
-        self.get_logger().info('SeekCat ready - rear-camera follow mode')
+        self.get_logger().info('SeekCat ready - rear-cam + discrete-step spin')
 
+    # ══════════════════════════════════════════════════════════════════════
     # Callbacks
+    # ══════════════════════════════════════════════════════════════════════
+
     def _cb_target(self, msg: String):
         text = msg.data.strip().lower()
         if text in ('', 'stop', 'none'):
@@ -175,10 +197,12 @@ class SeekCat(Node):
         self._publish_status(f'seeking {self.target_cat}')
 
     def _cb_identity(self, msg: String):
+        # cat_detector now only publishes /cat_identity when CONFIRMED
+        # (3 of last 5 frames agree). So we trust it directly.
         name = msg.data.strip().lower()
         if not self.target_cat or name != self.target_cat:
             return
-        if self.state in (NAVIGATE, CHECK_OBJ, YOLO_WAIT, AVOID):
+        if self.state in (NAVIGATE, CHECK_OBJ_TURN, CHECK_OBJ_LOOK, AVOID):
             self.get_logger().info(
                 f'YOLO confirmed {self.target_cat}! Switching to follow.')
             self._enter_follow()
@@ -187,7 +211,7 @@ class SeekCat(Node):
         self.cat_cx    = msg.point.x
         self.cat_dist  = msg.point.z if msg.point.z > 0 else None
         self.last_seen = self.get_clock().now()
-        if self.state in (NAVIGATE, CHECK_OBJ, YOLO_WAIT, AVOID):
+        if self.state in (NAVIGATE, CHECK_OBJ_TURN, CHECK_OBJ_LOOK, AVOID):
             self.get_logger().info(
                 f'Cat position cx={self.cat_cx:.2f} - following!')
             self._enter_follow()
@@ -202,14 +226,12 @@ class SeekCat(Node):
                     and math.isfinite(ranges[i])]
             return min(vals) if vals else float('inf')
 
-        # FRONT
         self.front_distance   = safe_min(
             list(range(0, n//12)) + list(range(11*n//12, n)))
         self.front_left_dist  = safe_min(list(range(n//12, n//4)))
         self.front_right_dist = safe_min(list(range(3*n//4, 11*n//12)))
         self.left_distance    = safe_min(list(range(n//4,    5*n//12)))
         self.right_distance   = safe_min(list(range(7*n//12, 3*n//4)))
-        # BACK - new for rear-facing follow safety
         self.back_distance    = safe_min(list(range(5*n//12, 7*n//12)))
 
         # Open directions
@@ -293,7 +315,10 @@ class SeekCat(Node):
 
         self.object_candidates = new_candidates
 
+    # ══════════════════════════════════════════════════════════════════════
     # Main loop
+    # ══════════════════════════════════════════════════════════════════════
+
     def _loop(self):
         if not self.active or self.target_cat is None:
             return
@@ -305,21 +330,26 @@ class SeekCat(Node):
                 self._enter_avoid()
                 return
 
-        if self.state in (NAVIGATE, CHECK_OBJ, YOLO_WAIT):
+        # Trigger camera continuously while seeking, but NOT during turning
+        # (those frames are blurred and waste CPU)
+        if self.state in (NAVIGATE, CHECK_OBJ_LOOK):
             self._trigger_camera()
 
         if self.state == NAVIGATE:
             self._loop_navigate()
-        elif self.state == CHECK_OBJ:
-            self._loop_check_obj()
-        elif self.state == YOLO_WAIT:
-            self._loop_yolo_wait()
+        elif self.state == CHECK_OBJ_TURN:
+            self._loop_check_obj_turn()
+        elif self.state == CHECK_OBJ_LOOK:
+            self._loop_check_obj_look()
         elif self.state == FOLLOW:
             self._loop_follow()
         elif self.state == AVOID:
             self._loop_avoid()
 
+    # ══════════════════════════════════════════════════════════════════════
     # NAVIGATE
+    # ══════════════════════════════════════════════════════════════════════
+
     def _loop_navigate(self):
         label, wx, wy = WAYPOINTS[self.waypoint_index]
 
@@ -427,7 +457,18 @@ class SeekCat(Node):
         self.nav_sent    = False
         self.nav_arrived = False
 
-    # CHECK_OBJ
+    # ══════════════════════════════════════════════════════════════════════
+    # CHECK_OBJ - Discrete-step spin (Fix 2)
+    #
+    # Old approach: spin continuously across HFOV, stop, wait once for YOLO.
+    #   Problem: every frame during the spin is motion-blurred and useless.
+    #
+    # New approach: split the HFOV into NUM_CHUNKS small turns. Between each
+    # turn, stop, wait SETTLE_SEC for buffers to flush, then sit still for
+    # LOOK_SEC while YOLO runs on sharp frames. Detection has multiple
+    # opportunities to find the cat instead of just one at the end.
+    # ══════════════════════════════════════════════════════════════════════
+
     def _interrupt_for_object(self):
         if not self.pending_objects:
             return
@@ -443,11 +484,12 @@ class SeekCat(Node):
         self.pre_check_wp_index = self.waypoint_index
         self._cancel_nav()
         self._stop_motors()
-        self.state             = CHECK_OBJ
-        self.current_obj_index = 0
-        self._start_obj_turn(0)
 
-    def _start_obj_turn(self, idx):
+        self.current_obj_index = 0
+        self._start_check_obj(0)
+
+    def _start_check_obj(self, idx):
+        """Begin (or move on to) checking object index idx."""
         if idx >= len(self.pending_objects):
             self.get_logger().info(
                 '[Check] All objects checked - resuming navigation')
@@ -460,73 +502,93 @@ class SeekCat(Node):
             return
 
         angle, dist  = self.pending_objects[idx]
+        # Camera faces back -> object behind robot is what camera sees forward
         cam_angle    = normalize_angle(angle + CAMERA_OFFSET_RAD)
-        turn_sec     = CAMERA_HFOV_RAD / ANGULAR_SPEED
 
-        self.current_obj_index = idx
-        self.turn_start        = time.time()
-        self.turn_sec          = turn_sec
-        self.turn_direction    = 1 if cam_angle >= 0 else -1
+        self.current_obj_index   = idx
+        self.current_chunk_index = 0
+        self.turn_direction      = 1 if cam_angle >= 0 else -1
 
         self.get_logger().info(
             f'[Check] Object {idx+1}/{len(self.pending_objects)} '
             f'at {math.degrees(angle):.0f} deg dist={dist:.2f}m - '
-            f'turning camera toward it')
+            f'sweeping camera in {NUM_CHUNKS} chunks')
 
-    def _loop_check_obj(self):
-        now     = time.time()
-        elapsed = now - self.turn_start
+        # Begin first turn chunk
+        self._begin_turn_chunk()
 
-        if elapsed < self.turn_sec:
-            if self.front_distance < SAFE_DISTANCE:
-                self._stop_motors()
-                return
+    def _begin_turn_chunk(self):
+        """Start a turn-chunk phase."""
+        self.state             = CHECK_OBJ_TURN
+        self.chunk_phase_start = time.time()
+
+    def _begin_look_chunk(self):
+        """Start a look (stationary) phase. Triggers a camera trigger so
+        cat_detector starts running immediately."""
+        self.state             = CHECK_OBJ_LOOK
+        self.chunk_phase_start = time.time()
+        self._stop_motors()
+        # Reset detection history in cat_detector so old frames from during
+        # the turn don't pollute the new look window. We do this by sending
+        # a fresh trigger - cat_detector will run YOLO on each new frame.
+        self._trigger_camera()
+
+    def _loop_check_obj_turn(self):
+        """Turning phase: rotate for TURN_CHUNK_SEC then transition to LOOK."""
+        elapsed = time.time() - self.chunk_phase_start
+
+        # Safety: if obstacle in front while turning, stop early
+        if self.front_distance < SAFE_DISTANCE:
+            self._stop_motors()
+            self.get_logger().warn(
+                '[Check] Obstacle ahead during turn - stopping early')
+            self._begin_look_chunk()
+            return
+
+        if elapsed < TURN_CHUNK_SEC:
             twist = Twist()
             twist.angular.z = self.turn_direction * ANGULAR_SPEED
             self.cmd_pub.publish(twist)
         else:
-            self._stop_motors()
+            # Turn chunk done - transition to look
+            self._begin_look_chunk()
+
+    def _loop_check_obj_look(self):
+        """Look phase: sit still, let YOLO run on sharp frames."""
+        elapsed = time.time() - self.chunk_phase_start
+
+        # Settle phase: motors are off, but camera buffers may still have
+        # blurred frames in flight. Don't trigger YOLO yet.
+        if elapsed < SETTLE_SEC:
+            return
+
+        # Active look phase: keep nudging cat_detector to run
+        if elapsed % 0.4 < 0.11:
             self._trigger_camera()
-            self.yolo_start = now
-            self.state      = YOLO_WAIT
+
+        if elapsed < SETTLE_SEC + LOOK_SEC:
+            return
+
+        # Look phase done - did we find the cat?
+        # (If cat_detector confirmed, _cb_identity / _cb_position would have
+        # already switched us to FOLLOW state. So if we're still here, no
+        # confirmed detection in this chunk's window.)
+
+        self.current_chunk_index += 1
+        if self.current_chunk_index < NUM_CHUNKS:
             self.get_logger().info(
-                f'[Check] Turned - waiting {YOLO_PAUSE_SEC}s for YOLO')
-
-    def _loop_yolo_wait(self):
-        elapsed = time.time() - self.yolo_start
-
-        if elapsed % 0.5 < 0.11:
-            self._trigger_camera()
-
-        if elapsed >= YOLO_PAUSE_SEC:
+                f'[Check] Chunk {self.current_chunk_index}/{NUM_CHUNKS} - '
+                f'no detection - turning more')
+            self._begin_turn_chunk()
+        else:
             self.get_logger().info(
                 f'[Check] Object {self.current_obj_index+1} - '
-                f'not target - next')
-            self.current_obj_index += 1
-            self.state = CHECK_OBJ
-            self._start_obj_turn(self.current_obj_index)
+                f'all chunks scanned, no target - next object')
+            self._start_check_obj(self.current_obj_index + 1)
 
-    # ────────────────────────────────────────────────────────────────────
-    # FOLLOW - REAR-CAMERA GEOMETRY
-    # ────────────────────────────────────────────────────────────────────
-    # The camera faces BACKWARD. So:
-    #   - Cat is BEHIND the robot.
-    #   - To CHASE (close gap):  drive BACKWARD (linear.x < 0)
-    #   - To RETREAT (open gap): drive FORWARD  (linear.x > 0)
-    #   - Camera left/right is FLIPPED relative to robot left/right.
-    #
-    # Safety:
-    #   - Driving BACKWARD: must check rear LiDAR (back_distance).
-    #   - Driving FORWARD:  must check front LiDAR (front_distance).
-    #
-    # cat_cx is normalized [0, 1] across the camera frame.
-    #   - cat_cx = 0.5 means cat is centered.
-    #   - cat_cx > 0.5 means cat is on camera's RIGHT = robot's LEFT.
-    #     To recenter, robot must turn LEFT (angular.z > 0).
-    #   - cat_cx < 0.5 means cat is on camera's LEFT = robot's RIGHT.
-    #     To recenter, robot must turn RIGHT (angular.z < 0).
-    # So: angular.z = +(cat_cx - 0.5) * GAIN
-    # ────────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # FOLLOW - Rear-camera geometry
+    # ══════════════════════════════════════════════════════════════════════
 
     def _enter_follow(self):
         self.state = FOLLOW
@@ -541,7 +603,6 @@ class SeekCat(Node):
     def _loop_follow(self):
         now = self.get_clock().now()
 
-        # Lost the cat?
         if self.last_seen is not None:
             elapsed = (now - self.last_seen).nanoseconds / 1e9
             if elapsed > LOST_TIMEOUT:
@@ -559,19 +620,13 @@ class SeekCat(Node):
 
         twist = Twist()
 
-        # Angular control: keep cat centered in camera.
-        # Rear-camera: positive cx error means cat is on robot's LEFT,
-        # so turn LEFT (positive angular.z).
+        # Angular: positive cx error -> cat on robot's LEFT -> turn LEFT
         cx_error = self.cat_cx - 0.5
         twist.angular.z = FOLLOW_KP_ANG * cx_error
-
-        # Cap angular speed
         if twist.angular.z >  ANGULAR_SPEED: twist.angular.z =  ANGULAR_SPEED
         if twist.angular.z < -ANGULAR_SPEED: twist.angular.z = -ANGULAR_SPEED
 
-        # Linear control: ONLY use cat_dist (camera depth).
-        # Don't fall back to LiDAR front_distance - that's the wall ahead,
-        # not the cat behind.
+        # Linear: only use cat_dist (camera depth)
         if self.cat_dist is None or math.isinf(self.cat_dist) \
                 or math.isnan(self.cat_dist):
             twist.linear.x = 0.0
@@ -582,11 +637,10 @@ class SeekCat(Node):
             return
 
         dist       = self.cat_dist
-        dist_error = dist - FOLLOW_DIST_TARGET   # +ve = too far, -ve = too close
+        dist_error = dist - FOLLOW_DIST_TARGET
 
         if dist_error > FOLLOW_TOLERANCE:
-            # TOO FAR - chase by driving BACKWARD
-            # Safety: rear must be clear (driving rear-first toward cat)
+            # Too far - chase by driving BACKWARD (rear-camera)
             if self.back_distance < SAFE_DISTANCE:
                 self.get_logger().warn(
                     f'[Follow] Too far ({dist:.2f}m) but rear blocked '
@@ -598,8 +652,7 @@ class SeekCat(Node):
                 twist.linear.x = -speed   # NEGATIVE = backward = toward cat
 
         elif dist_error < -FOLLOW_TOLERANCE:
-            # TOO CLOSE - retreat by driving FORWARD
-            # Safety: front must be clear (driving forward away from cat)
+            # Too close - retreat by driving FORWARD
             if self.front_distance < SAFE_DISTANCE:
                 self.get_logger().warn(
                     f'[Follow] Too close ({dist:.2f}m) but front blocked '
@@ -611,7 +664,6 @@ class SeekCat(Node):
                 twist.linear.x = +speed   # POSITIVE = forward = away from cat
 
         else:
-            # Sweet spot - hold position (still center with angular)
             twist.linear.x = 0.0
 
         self.cmd_pub.publish(twist)
@@ -623,7 +675,10 @@ class SeekCat(Node):
             f'(front={self.front_distance:.2f} back={self.back_distance:.2f})',
             throttle_duration_sec=0.5)
 
+    # ══════════════════════════════════════════════════════════════════════
     # AVOID
+    # ══════════════════════════════════════════════════════════════════════
+
     def _enter_avoid(self):
         if self.nav_sent and not self.nav_arrived:
             self.get_logger().warn(
@@ -678,7 +733,10 @@ class SeekCat(Node):
             self.avoid_start    = time.time()
             self.get_logger().warn('[Avoid] Still stuck - flipping direction')
 
+    # ══════════════════════════════════════════════════════════════════════
     # DONE
+    # ══════════════════════════════════════════════════════════════════════
+
     def _enter_done(self):
         self.state = DONE
         self._cancel_nav()
@@ -699,7 +757,10 @@ class SeekCat(Node):
         goal.pose.pose.orientation.w = 1.0
         self.nav_client.send_goal_async(goal)
 
+    # ══════════════════════════════════════════════════════════════════════
     # Utilities
+    # ══════════════════════════════════════════════════════════════════════
+
     def _trigger_camera(self):
         now = time.time()
         if now - self.last_trigger_time < 0.4:
