@@ -2,12 +2,12 @@
 """
 seek_cat.py - Fixed
 ==================
-Includes:
   - Rear-camera follow geometry (chase backward, retreat forward)
-  - Continuous-spin object check (better detection performance than
-    discrete-step in testing)
-  - Trusts cat_detector's multi-frame confirmation - identity callback
-    fires only on confirmed detections
+  - Continuous-spin object check
+  - Trusts cat_detector's multi-frame confirmation
+  - Distance now estimated from bbox width by cat_detector
+  - When distance is unavailable, falls back to slow constant-speed crawl
+    toward cat (same approach as the ball follower reference)
   - Robust shutdown
 """
 
@@ -34,13 +34,16 @@ CAMERA_HFOV_RAD     = math.radians(CAMERA_HFOV_DEG)
 CAMERA_OFFSET_RAD   = math.pi
 YOLO_PAUSE_SEC      = 2.0
 
-# Follow - keep about 1m from the cat (assignment spec)
+# Follow
 FOLLOW_DIST_TARGET  = 1.0
-FOLLOW_TOLERANCE    = 0.10
+FOLLOW_TOLERANCE    = 0.15
 FOLLOW_SPEED_MAX    = 0.20
 FOLLOW_KP_LIN       = 0.4
 FOLLOW_KP_ANG       = 1.5
 LOST_TIMEOUT        = 5.0
+# When depth/distance is unavailable, crawl backward at this speed
+# (rear-camera version of the ball follower's "linear.x = 0.05")
+FOLLOW_NO_DEPTH_SPEED = 0.05   # m/s, backward toward cat
 
 # LiDAR motion detection
 MOTION_DIST_THRESH   = 0.25
@@ -95,12 +98,10 @@ class SeekCat(Node):
     def __init__(self):
         super().__init__('seek_cat')
 
-        # Core
         self.state       = IDLE
         self.target_cat  = None
         self.active      = False
 
-        # Navigation
         self.waypoint_index   = 0
         self.search_cycles    = 0
         self.nav_goal_handle  = None
@@ -110,7 +111,6 @@ class SeekCat(Node):
         self.nav_retries      = 0
         self._last_goal_time  = 0.0
 
-        # Object checking
         self.pending_objects    = []
         self.object_candidates  = {}
         self.current_obj_index  = 0
@@ -121,12 +121,10 @@ class SeekCat(Node):
         self.pre_check_state    = NAVIGATE
         self.pre_check_wp_index = 0
 
-        # Follow
         self.cat_cx    = None
         self.cat_dist  = None
         self.last_seen = None
 
-        # LiDAR
         self.prev_scan        = None
         self.front_distance   = float('inf')
         self.front_left_dist  = float('inf')
@@ -136,31 +134,26 @@ class SeekCat(Node):
         self.back_distance    = float('inf')
         self.open_directions  = []
 
-        # Avoid
         self.avoid_turn_dir  = 1
         self.avoid_start     = None
         self.pre_avoid_state = NAVIGATE
 
-        # Camera trigger rate limit
         self.last_trigger_time = 0.0
 
-        # Nav2
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # Subs
         self.create_subscription(String,       '/cat_target',   self._cb_target,   10)
         self.create_subscription(String,       '/cat_identity', self._cb_identity, 10)
         self.create_subscription(PointStamped, '/cat_position', self._cb_position, 10)
         self.create_subscription(LaserScan,    '/scan',         self._cb_scan,     10)
 
-        # Pubs
         self.cmd_pub    = self.create_publisher(Twist,  '/cmd_vel',              10)
         self.cam_pub    = self.create_publisher(String, '/camera_check_trigger', 10)
         self.target_pub = self.create_publisher(String, '/cat_target',           10)
         self.status_pub = self.create_publisher(String, '/seek_status',          10)
 
         self.create_timer(0.1, self._loop)
-        self.get_logger().info('SeekCat ready - rear-cam, continuous spin')
+        self.get_logger().info('SeekCat ready - rear-cam follow with crawl fallback')
 
     # Callbacks
     def _cb_target(self, msg: String):
@@ -183,8 +176,6 @@ class SeekCat(Node):
         self._publish_status(f'seeking {self.target_cat}')
 
     def _cb_identity(self, msg: String):
-        # cat_detector publishes /cat_identity only when 3 of last 5 frames
-        # agree (multi-frame confirmation). So we trust it directly.
         name = msg.data.strip().lower()
         if not self.target_cat or name != self.target_cat:
             return
@@ -195,11 +186,12 @@ class SeekCat(Node):
 
     def _cb_position(self, msg: PointStamped):
         self.cat_cx    = msg.point.x
-        self.cat_dist  = msg.point.z if msg.point.z > 0 else None
+        # cat_detector now publishes estimated distance as point.z
+        self.cat_dist  = msg.point.z if msg.point.z > 0.05 else None
         self.last_seen = self.get_clock().now()
         if self.state in (NAVIGATE, CHECK_OBJ, YOLO_WAIT, AVOID):
             self.get_logger().info(
-                f'Cat position cx={self.cat_cx:.2f} - following!')
+                f'Cat position cx={self.cat_cx:.2f} dist={self.cat_dist} - following!')
             self._enter_follow()
 
     def _cb_scan(self, msg: LaserScan):
@@ -220,7 +212,6 @@ class SeekCat(Node):
         self.right_distance   = safe_min(list(range(7*n//12, 3*n//4)))
         self.back_distance    = safe_min(list(range(5*n//12, 7*n//12)))
 
-        # Open directions
         open_dirs = []
         num_sectors = int(math.ceil(2 * math.pi / CAMERA_HFOV_RAD))
         for s in range(num_sectors):
@@ -234,7 +225,6 @@ class SeekCat(Node):
                 open_dirs.append((center, min(sector_vals)))
         self.open_directions = open_dirs
 
-        # Motion detection with persistence filter
         if not self.active or self.prev_scan is None:
             self.prev_scan = msg
             return
@@ -301,7 +291,6 @@ class SeekCat(Node):
 
         self.object_candidates = new_candidates
 
-    # Main loop
     def _loop(self):
         if not self.active or self.target_cat is None:
             return
@@ -327,7 +316,6 @@ class SeekCat(Node):
         elif self.state == AVOID:
             self._loop_avoid()
 
-    # NAVIGATE
     def _loop_navigate(self):
         label, wx, wy = WAYPOINTS[self.waypoint_index]
 
@@ -391,6 +379,9 @@ class SeekCat(Node):
         handle.get_result_async().add_done_callback(self._nav_result_cb)
 
     def _nav_result_cb(self, future):
+        # If we cancelled because we entered FOLLOW, ignore
+        if self.state == FOLLOW:
+            return
         status = future.result().status
         if status == 4:
             self.get_logger().info('[Nav] Physically arrived!')
@@ -400,6 +391,9 @@ class SeekCat(Node):
             self._handle_nav_failure()
 
     def _handle_nav_failure(self):
+        # Don't advance waypoint if we're following
+        if self.state == FOLLOW:
+            return
         self.nav_retries += 1
         if self.nav_retries <= 2:
             self.nav_sent = False
@@ -408,6 +402,9 @@ class SeekCat(Node):
             self._advance_waypoint()
 
     def _advance_waypoint(self):
+        # Don't advance if we're already in FOLLOW (cat found)
+        if self.state == FOLLOW:
+            return
         self.waypoint_index += 1
         self.nav_sent        = False
         self.nav_arrived     = False
@@ -435,7 +432,7 @@ class SeekCat(Node):
         self.nav_sent    = False
         self.nav_arrived = False
 
-    # CHECK_OBJ - continuous spin (better in testing than chunked)
+    # CHECK_OBJ - continuous spin
     def _interrupt_for_object(self):
         if not self.pending_objects:
             return
@@ -520,6 +517,10 @@ class SeekCat(Node):
     #   - To CHASE (close gap):  drive BACKWARD (linear.x < 0)
     #   - To RETREAT (open gap): drive FORWARD  (linear.x > 0)
     # cat_cx > 0.5 means cat is on camera-right = robot's LEFT, turn LEFT.
+    #
+    # When cat_dist is unavailable: still crawl backward at slow constant
+    # speed (same idea as ball follower's "no depth" branch). Angular
+    # control keeps cat centered while we creep toward it.
     # ──────────────────────────────────────────────────────────────────
 
     def _enter_follow(self):
@@ -552,24 +553,37 @@ class SeekCat(Node):
 
         twist = Twist()
 
-        # Angular: positive cx error -> cat on robot's LEFT -> turn LEFT
+        # ─── Angular control: keep cat centered ──────────────────────
+        # Rear-camera: positive cx error -> cat on robot's LEFT -> turn LEFT
         cx_error = self.cat_cx - 0.5
         twist.angular.z = FOLLOW_KP_ANG * cx_error
         if twist.angular.z >  ANGULAR_SPEED: twist.angular.z =  ANGULAR_SPEED
         if twist.angular.z < -ANGULAR_SPEED: twist.angular.z = -ANGULAR_SPEED
 
-        # Linear: only use cat_dist (camera depth)
-        if self.cat_dist is None or math.isinf(self.cat_dist) \
-                or math.isnan(self.cat_dist):
-            twist.linear.x = 0.0
+        # ─── Linear control ──────────────────────────────────────────
+        if self.cat_dist is None:
+            # No distance estimate - crawl backward at slow constant speed
+            # (the rear-camera version of the ball follower's
+            # "twist.linear.x = 0.05" no-depth fallback)
+            if self.back_distance < SAFE_DISTANCE:
+                # Don't crawl into a wall behind us
+                twist.linear.x = 0.0
+                self.get_logger().warn(
+                    f'[Follow] cx={self.cat_cx:.2f} no_depth, rear blocked '
+                    f'({self.back_distance:.2f}m) - turning only',
+                    throttle_duration_sec=1.0)
+            else:
+                twist.linear.x = -FOLLOW_NO_DEPTH_SPEED   # backward = toward cat
+                self.get_logger().info(
+                    f'[Follow] cx={self.cat_cx:.2f} no_depth - crawling back '
+                    f'lin={twist.linear.x:+.2f} ang={twist.angular.z:+.2f}',
+                    throttle_duration_sec=1.0)
             self.cmd_pub.publish(twist)
-            self.get_logger().info(
-                f'[Follow] cx={self.cat_cx:.2f} no_depth ang={twist.angular.z:+.2f}',
-                throttle_duration_sec=1.0)
             return
 
+        # Have a distance estimate - use P-control toward FOLLOW_DIST_TARGET
         dist       = self.cat_dist
-        dist_error = dist - FOLLOW_DIST_TARGET
+        dist_error = dist - FOLLOW_DIST_TARGET    # +ve = too far, -ve = too close
 
         if dist_error > FOLLOW_TOLERANCE:
             # Too far - chase by driving BACKWARD (rear-camera)
@@ -596,6 +610,7 @@ class SeekCat(Node):
                 twist.linear.x = +speed   # POSITIVE = forward = away from cat
 
         else:
+            # Sweet spot - hold position (still center with angular)
             twist.linear.x = 0.0
 
         self.cmd_pub.publish(twist)
@@ -607,7 +622,6 @@ class SeekCat(Node):
             f'(front={self.front_distance:.2f} back={self.back_distance:.2f})',
             throttle_duration_sec=0.5)
 
-    # AVOID
     def _enter_avoid(self):
         if self.nav_sent and not self.nav_arrived:
             self.get_logger().warn(
@@ -662,7 +676,6 @@ class SeekCat(Node):
             self.avoid_start    = time.time()
             self.get_logger().warn('[Avoid] Still stuck - flipping direction')
 
-    # DONE
     def _enter_done(self):
         self.state = DONE
         self._cancel_nav()
@@ -683,7 +696,6 @@ class SeekCat(Node):
         goal.pose.pose.orientation.w = 1.0
         self.nav_client.send_goal_async(goal)
 
-    # Utilities
     def _trigger_camera(self):
         now = time.time()
         if now - self.last_trigger_time < 0.4:
@@ -730,7 +742,6 @@ class SeekCat(Node):
 
 
 def _safe_cleanup(node):
-    """Cancel any in-flight Nav2 goal and stop motors."""
     if node is not None:
         try:
             node._cancel_nav()
