@@ -8,9 +8,10 @@ Now supports TWO modes via the `mode` launch argument:
   ros2 launch catrun catrun.launch.py mode:=play
 
   watch : front CSI camera + cat_detector(watch) + seek_cat
-          (robot wanders, finds cat, follows like ball-follower)
-  play  : front CSI camera + cat_detector(play)  + flee_behavior
-          (robot ambushes, sees cat, smart-direction flee)
+          (single camera. robot wanders, finds cat, follows like ball-follower)
+  play  : front CSI + rear USB cameras + cat_detector(play) + flee_behavior
+          (dual camera. robot ambushes, sees cat, smart-direction flee.
+           cat_detector picks which camera feed to use based on state.)
 
 Order of operations (unchanged):
   t=0s   TF (base_link -> laser, base_link -> base_footprint)
@@ -146,16 +147,15 @@ def _build_actions(context, *args, **kwargs):
 
     # ─── Mode-specific: camera + detector + behavior ──────────────────
     if mode == 'watch':
+        # WATCH MODE: single front CSI camera publishing to legacy
+        # /camera/catrun topic. cat_detector also subscribes to that.
         camera_params = {
             'camera_source': 'csi0',
             'flip_method':   2,
-            # Lower resolution + slower framerate = much less CPU/bandwidth.
-            # YOLO downscales to imgsz=192 internally anyway, so giving it
-            # 1280x720 was wasteful. 640x360 keeps plenty of detail for cat
-            # detection while letting camera_node publish at full rate.
             'width':         640,
             'height':        360,
             'framerate':     15,
+            'publish_topic': '/camera/catrun',
         }
         detector_params = {
             'mode':     'watch',
@@ -167,18 +167,24 @@ def _build_actions(context, *args, **kwargs):
             name='seek_cat',
             output='screen',
         )
+        # Single camera node for watch mode
+        camera_nodes = [
+            Node(
+                package='catrun',
+                executable='camera_node',
+                name='camera_node',
+                parameters=[camera_params],
+                output='screen',
+            ),
+        ]
     else:  # play
-        # PLAY MODE: single front CSI camera, smart-direction flee.
-        # The rear USB camera was unreliable; using the front camera
-        # only is simpler and more stable. The robot flees forward
-        # (camera looks where it's running), and stops to scan after.
-        camera_params = {
-            'camera_source': 'csi0',
-            'flip_method':   2,
-            'width':         640,
-            'height':        360,
-            'framerate':     15,
-        }
+        # PLAY MODE: DUAL camera.
+        #   /camera/front  - CSI sensor 0 (used in ambush/seek/turn)
+        #   /camera/rear   - USB at /dev/video1 (used during flee/check)
+        # cat_detector subscribes to BOTH and processes whichever
+        # matches the current robot state (from /seek_status).
+        # It also mirrors the active feed to /camera/catrun so the
+        # web UI keeps working without changes.
         detector_params = {
             'mode':     'play',
             'focal_px': FRONT_FOCAL_PX,
@@ -189,21 +195,42 @@ def _build_actions(context, *args, **kwargs):
             name='flee_behavior',
             output='screen',
         )
+        camera_nodes = [
+            Node(
+                package='catrun',
+                executable='camera_node',
+                name='camera_front',
+                parameters=[{
+                    'camera_source': 'csi0',
+                    'flip_method':   2,
+                    'width':         640,
+                    'height':        360,
+                    'framerate':     15,
+                    'publish_topic': '/camera/front',
+                }],
+                output='screen',
+            ),
+            Node(
+                package='catrun',
+                executable='camera_node',
+                name='camera_rear',
+                parameters=[{
+                    'camera_source': 'usb1',
+                    'device_path':   '/dev/video1',
+                    'width':         640,
+                    'height':        480,
+                    'framerate':     15,
+                    'publish_topic': '/camera/rear',
+                }],
+                output='screen',
+            ),
+        ]
 
-    # Camera + detector + behavior come up at t=2s in both modes.
-    # That's after the LiDAR has had a moment but before any Nav2
-    # bringup, so the pipeline is ready when the user sends a target.
+    # Camera(s) + detector + behavior come up at t=2s in both modes.
     behavior_actions = [
         TimerAction(
             period=2.0,
-            actions=[
-                Node(
-                    package='catrun',
-                    executable='camera_node',
-                    name='camera_node',
-                    parameters=[camera_params],
-                    output='screen',
-                ),
+            actions=camera_nodes + [
                 Node(
                     package='catrun',
                     executable='cat_detector',

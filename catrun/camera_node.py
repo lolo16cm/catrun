@@ -97,6 +97,10 @@ class CameraNode(Node):
         self.declare_parameter('height', 0)
         self.declare_parameter('framerate', 15)   # publish rate in Hz
         self.declare_parameter('device_path', '')
+        # Topic to publish on. Default '/camera/catrun' for backward
+        # compatibility. In dual-camera play mode each node uses a
+        # different topic (e.g. /camera/front and /camera/rear).
+        self.declare_parameter('publish_topic', '/camera/catrun')
 
         source      = self.get_parameter('camera_source').value.lower().strip()
         flip_method = int(self.get_parameter('flip_method').value)
@@ -104,9 +108,10 @@ class CameraNode(Node):
         height      = int(self.get_parameter('height').value)
         framerate   = int(self.get_parameter('framerate').value)
         device_path = self.get_parameter('device_path').value.strip()
+        publish_topic = self.get_parameter('publish_topic').value.strip()
 
         self.bridge = CvBridge()
-        self.pub    = self.create_publisher(Image, '/camera/catrun', 10)
+        self.pub    = self.create_publisher(Image, publish_topic, 10)
 
         # ─── pick the right pipeline ──────────────────────────────────
         if source in ('csi0', 'csi1'):
@@ -165,7 +170,7 @@ class CameraNode(Node):
                 return
 
         self.get_logger().info(
-            f'Camera opened! Publishing to /camera/catrun ({source})')
+            f'Camera opened! Publishing to {publish_topic} ({source})')
 
         # Force OpenCV's internal buffer to size 1 so cap.read() returns
         # the newest frame, not a queued old one.

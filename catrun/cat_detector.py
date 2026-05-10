@@ -142,9 +142,35 @@ class CatDetector(Node):
         # Each entry: dict {ts, name, cx, cy, dist, bbox_w, conf}
         self.detection_history = deque(maxlen=CONFIRM_WINDOW)
 
-        self.create_subscription(Image,  '/camera/catrun',          self.image_cb,   10)
+        # ─── Dual-camera support for play mode ────────────────────────
+        # In play mode the launch file starts TWO camera nodes:
+        #   /camera/front  - front CSI (csi0)  - default in watch & most play states
+        #   /camera/rear   - rear USB  (usb1)  - used during FLEE_RUN to watch pursuer
+        # In watch mode only /camera/catrun is published (legacy topic),
+        # and we subscribe to it too. We process frames from the camera
+        # that matches the CURRENT robot state.
+        # The 'active' camera is selected based on the latest /seek_status:
+        #   'fleeing' / 'checking'  -> rear (watch the threat behind)
+        #   anything else            -> front
+        self.latest_status      = ''
+        self.latest_front_frame = None    # last image from /camera/front
+        self.latest_rear_frame  = None    # last image from /camera/rear
+        self.latest_legacy_frame = None   # last image from /camera/catrun (watch mode)
+
+        # The "active" feed is the one we actually run YOLO on AND
+        # mirror to /camera/catrun for the web UI.
+        self.create_subscription(Image,  '/camera/front',           self._front_cb,   10)
+        self.create_subscription(Image,  '/camera/rear',            self._rear_cb,    10)
+        self.create_subscription(Image,  '/camera/catrun',          self._legacy_cb,  10)
+        self.create_subscription(String, '/seek_status',            self._status_cb,  10)
         self.create_subscription(String, '/cat_target',             self.target_cb,  10)
         self.create_subscription(String, '/camera_check_trigger',   self.trigger_cb, 10)
+
+        # Mirror the active camera onto /camera/catrun so web_stream
+        # (and any other legacy subscriber) keeps working. We only
+        # mirror in play mode; in watch mode /camera/catrun is already
+        # published directly by camera_node so we skip mirroring.
+        self.pub_catrun_mirror = self.create_publisher(Image, '/camera/catrun', 10)
 
         self.pub_position  = self.create_publisher(PointStamped, '/cat_position',        10)
         self.pub_identity  = self.create_publisher(String,       '/cat_identity',         10)
@@ -208,17 +234,88 @@ class CatDetector(Node):
     def trigger_cb(self, msg: String):
         self.triggered = True
 
-    def image_cb(self, msg: Image):
+    # ─── Camera feed callbacks ────────────────────────────────────────
+    # Three subscriptions:
+    #   /camera/front  - dual-cam play mode: front CSI
+    #   /camera/rear   - dual-cam play mode: rear USB
+    #   /camera/catrun - single-cam watch mode (legacy)
+    # Each callback stores its frame; the active-feed selector decides
+    # which one to feed to YOLO and mirror to /camera/catrun.
+
+    def _status_cb(self, msg: String):
+        self.latest_status = msg.data.strip().lower()
+
+    def _active_feed_name(self):
+        """Pick which feed YOLO should process this tick.
+        - During 'fleeing' or 'checking', use the REAR camera (watch
+          the pursuer behind us).
+        - Otherwise (ambushing/seeking/idle/etc.) use the FRONT camera.
+        - If we don't have play-mode feeds, fall back to legacy.
+        """
+        in_flee = self.latest_status in ('fleeing', 'checking')
+        if in_flee and self.latest_rear_frame is not None:
+            return 'rear'
+        if not in_flee and self.latest_front_frame is not None:
+            return 'front'
+        # Fall back: whichever play-mode feed we have
+        if self.latest_front_frame is not None:
+            return 'front'
+        if self.latest_rear_frame is not None:
+            return 'rear'
+        # No play-mode feeds at all -> watch mode legacy feed
+        return 'legacy'
+
+    def _front_cb(self, msg: Image):
         self.frame_count += 1
         if self.frame_count == 1:
             self.get_logger().info(
-                f'[{self.mode}] Camera connected! {msg.width}x{msg.height}')
+                f'[{self.mode}] FRONT camera connected! '
+                f'{msg.width}x{msg.height}')
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
             with self.frame_lock:
-                self.latest_frame = frame
+                self.latest_front_frame = frame
+                if self._active_feed_name() == 'front':
+                    self.latest_frame = frame
+            # Mirror to /camera/catrun if this is the active feed
+            if self._active_feed_name() == 'front':
+                self.pub_catrun_mirror.publish(msg)
         except Exception as e:
-            self.get_logger().error(f'cv_bridge error: {e}')
+            self.get_logger().error(f'cv_bridge error (front): {e}')
+
+    def _rear_cb(self, msg: Image):
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            with self.frame_lock:
+                self.latest_rear_frame = frame
+                if self._active_feed_name() == 'rear':
+                    self.latest_frame = frame
+            if self._active_feed_name() == 'rear':
+                self.pub_catrun_mirror.publish(msg)
+        except Exception as e:
+            self.get_logger().error(f'cv_bridge error (rear): {e}')
+
+    def _legacy_cb(self, msg: Image):
+        """Watch mode (and any other single-camera config) publishes
+        directly to /camera/catrun. Process that too, but never mirror
+        (the publisher IS the source, so we'd loop)."""
+        # Don't process if we're already receiving a front/rear stream
+        # (avoids double-processing in dual-cam mode).
+        if (self.latest_front_frame is not None
+                or self.latest_rear_frame is not None):
+            return
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            with self.frame_lock:
+                self.latest_legacy_frame = frame
+                self.latest_frame = frame
+            if self.frame_count == 0:
+                self.get_logger().info(
+                    f'[{self.mode}] Legacy camera connected! '
+                    f'{msg.width}x{msg.height}')
+            self.frame_count += 1
+        except Exception as e:
+            self.get_logger().error(f'cv_bridge error (legacy): {e}')
 
     def detection_loop(self):
         now = time.time()
@@ -404,13 +501,16 @@ class CatDetector(Node):
         if self.frame_count == 0:
             self.get_logger().warn(
                 f'[{self.mode}] No frames yet! '
-                f'Check: ros2 topic hz /camera/catrun')
+                f'Check: ros2 topic hz /camera/front '
+                f'or ros2 topic hz /camera/catrun')
         else:
+            active = self._active_feed_name()
             self.get_logger().info(
                 f'[{self.mode}] frames={self.frame_count} | '
                 f'detections={self.detection_count} | '
                 f'confirmed={self.confirmed_count} | '
-                f'target={self.target_cat or "any"}')
+                f'target={self.target_cat or "any"} | '
+                f'active={active} (status={self.latest_status or "n/a"})')
 
 
 def _safe_cleanup(node):
