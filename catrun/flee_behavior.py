@@ -73,6 +73,19 @@ SCAN_AFTER_CAT_TIMEOUT = 1.5  # cat sighting older than this = "no cat"
 # ─── Seek (cat-hunting wander) ───────────────────────────────────────────
 SEEK_DURATION_SEC    = 30.0   # max time spent seeking before back to ambush
 
+# ─── LiDAR rear-motion detection ─────────────────────────────────────────
+# We use the LiDAR (which is 360-deg) to watch the rear sector for moving
+# objects while the robot is idle. When persistent cat-sized motion shows
+# up behind, we switch the camera feed to rear and check if it's a cat.
+REAR_MOTION_DIST_THRESH  = 0.20    # m: scan-to-scan delta to call "moving"
+REAR_MOTION_RANGE_MAX    = 3.0     # m: only consider motion within this range
+REAR_MOTION_CLUSTER_MIN  = 5       # min points in a moving cluster
+REAR_MOTION_SIZE_MIN     = 0.10    # m: cluster width min
+REAR_MOTION_SIZE_MAX     = 0.60    # m: cluster width max
+REAR_MOTION_PERSIST      = 2       # need this many scans of agreement
+REAR_HALF_RAD            = math.radians(45.0)   # rear sector half-width (~90 deg total)
+CHECK_REAR_DURATION_SEC  = 2.5     # how long to keep the rear camera active
+
 # ─── Confirm (stop & verify before fleeing) ──────────────────────────────
 # When YOLO publishes /cat_position, robot stops and watches for a moment
 # to make sure it really is a cat (not a fluke). Need at least
@@ -95,6 +108,7 @@ NUM_SECTORS          = 8      # 45 deg each
 # ─── States ──────────────────────────────────────────────────────────────
 IDLE          = 'IDLE'
 WAIT_AMBUSH   = 'WAIT_AMBUSH'
+CHECK_REAR    = 'CHECK_REAR'     # LiDAR saw rear motion - switch camera to rear
 CONFIRM_FLEE  = 'CONFIRM_FLEE'   # stopped, watching to verify cat is real
 FLEE_TURN     = 'FLEE_TURN'
 FLEE_RUN      = 'FLEE_RUN'
@@ -140,6 +154,11 @@ class FleeBehavior(Node):
         self.confirm_start = None
         self.confirm_hits  = 0
         self.confirm_camera = 'front'  # which camera triggered the confirmation
+
+        # Rear-motion LiDAR detection
+        self.prev_scan        = None
+        self.rear_motion_persist = 0
+        self.check_rear_start = None
 
         # Robot heading (estimated from yaw integration of /cmd_vel since
         # we have no encoders). For relative heading targets only.
@@ -215,10 +234,10 @@ class FleeBehavior(Node):
         else:
             self.cat_camera = 'front'
 
-        # If we're idle (ambush/scan/seek), STOP and confirm rather than
-        # snap-react. Sneaky false positives have caused the robot to
-        # flee for nothing - the confirm hold filters those out.
-        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT):
+        # If we're idle (ambush/scan/seek/check_rear), STOP and confirm
+        # rather than snap-react. Sneaky false positives have caused the
+        # robot to flee for nothing - the confirm hold filters those out.
+        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT, CHECK_REAR):
             self.get_logger().info(
                 f'[/cat_position] cx={self.cat_cx:.2f} '
                 f'dist={"n/a" if self.cat_dist is None else f"{self.cat_dist:.2f}m"} '
@@ -276,6 +295,59 @@ class FleeBehavior(Node):
         for s in range(NUM_SECTORS):
             self.sector_clearance[s] = (min(sector_vals[s])
                                         if sector_vals[s] else 0.0)
+
+        # ─── Rear-sector motion detection ─────────────────────────────
+        # While idling (ambush/seek), compare to previous scan in the
+        # REAR half. If a persistent cat-sized cluster moves there,
+        # switch the camera feed to rear to verify with YOLO.
+        if (self.active
+                and self.state in (WAIT_AMBUSH, SEEK_CAT, SCAN_AFTER)
+                and self.prev_scan is not None):
+            self._check_rear_motion(msg, ranges, eff_min)
+        self.prev_scan = msg
+
+    def _check_rear_motion(self, msg, ranges, eff_min):
+        prev_ranges = self.prev_scan.ranges
+        n    = len(ranges)
+        ainc = msg.angle_increment
+        amin = msg.angle_min
+        rmax = min(msg.range_max, REAR_MOTION_RANGE_MAX)
+
+        moving_pts = []
+        for i in range(min(n, len(prev_ranges))):
+            r_now  = ranges[i]
+            r_prev = prev_ranges[i]
+            if not (eff_min < r_now < rmax):
+                continue
+            if not (eff_min < r_prev < rmax):
+                continue
+            angle = normalize_angle(amin + i * ainc)
+            # Rear sector: angle far from 0, close to +/- pi
+            if abs(abs(angle) - math.pi) > REAR_HALF_RAD:
+                continue
+            if abs(r_now - r_prev) > REAR_MOTION_DIST_THRESH:
+                x = r_now * math.cos(angle)
+                y = r_now * math.sin(angle)
+                moving_pts.append((x, y))
+
+        if len(moving_pts) < REAR_MOTION_CLUSTER_MIN:
+            self.rear_motion_persist = max(0, self.rear_motion_persist - 1)
+            return
+
+        xs = [p[0] for p in moving_pts]
+        ys = [p[1] for p in moving_pts]
+        width = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if not (REAR_MOTION_SIZE_MIN <= width <= REAR_MOTION_SIZE_MAX):
+            self.rear_motion_persist = max(0, self.rear_motion_persist - 1)
+            return
+
+        self.rear_motion_persist += 1
+        if self.rear_motion_persist >= REAR_MOTION_PERSIST:
+            self.get_logger().info(
+                f'[LiDAR] Motion behind (width={width:.2f}m, '
+                f'{len(moving_pts)} pts) -> CHECK_REAR')
+            self.rear_motion_persist = 0
+            self._enter_check_rear()
 
     # ─── Heading estimation (no encoders) ─────────────────────────────
     def _update_yaw_from_cmd(self, ang_z):
@@ -380,11 +452,14 @@ class FleeBehavior(Node):
                 return
 
         # Trigger camera detector while we want to see cats
-        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT, CONFIRM_FLEE):
+        if self.state in (WAIT_AMBUSH, SCAN_AFTER, SEEK_CAT,
+                          CONFIRM_FLEE, CHECK_REAR):
             self._trigger_camera()
 
         if self.state == WAIT_AMBUSH:
             self._loop_wait_ambush()
+        elif self.state == CHECK_REAR:
+            self._loop_check_rear()
         elif self.state == CONFIRM_FLEE:
             self._loop_confirm_flee()
         elif self.state == FLEE_TURN:
@@ -425,6 +500,38 @@ class FleeBehavior(Node):
                 self._enter_seek_cat()
             else:
                 self._enter_wait_ambush()   # restart the ambush timer
+
+    # ─── CHECK_REAR ───────────────────────────────────────────────────
+    # LiDAR saw motion behind us. Switch the camera feed to rear (via
+    # /seek_status='check_rear') and watch for CHECK_REAR_DURATION_SEC.
+    # If YOLO confirms a cat -> CONFIRM_FLEE. If not -> back to AMBUSH.
+    # We DO NOT move during this state - the cat is behind us and any
+    # rotation would risk losing sight of it.
+    def _enter_check_rear(self):
+        if self.state == CHECK_REAR:
+            return   # already in it
+        self.state = CHECK_REAR
+        self.check_rear_start = time.time()
+        self._stop_motors()
+        # 'check_rear' status -> cat_detector switches to rear feed
+        self._publish_status('check_rear')
+        self.get_logger().info(
+            f'[CheckRear] Switching to rear camera, '
+            f'watching {CHECK_REAR_DURATION_SEC}s for cat')
+
+    def _loop_check_rear(self):
+        elapsed = time.time() - self.check_rear_start
+        self._stop_motors()
+        self._trigger_camera()
+
+        if elapsed >= CHECK_REAR_DURATION_SEC:
+            self.get_logger().info(
+                '[CheckRear] No cat seen - back to WAIT_AMBUSH')
+            self._enter_wait_ambush()
+            return
+
+        # If /cat_position arrives during this state, _cb_position
+        # handles it (transitions to CONFIRM_FLEE with cam=rear).
 
     # ─── CONFIRM_FLEE ─────────────────────────────────────────────────
     # When the detector first publishes /cat_position, we don't react
@@ -677,6 +784,9 @@ class FleeBehavior(Node):
             elif self.pre_avoid_state == CONFIRM_FLEE:
                 # Restart the confirm hold so we get a full window
                 self._enter_confirm_flee(initial_camera=self.cat_camera)
+            elif self.pre_avoid_state == CHECK_REAR:
+                # Restart the rear-check timer
+                self._enter_check_rear()
             else:
                 self.state = self.pre_avoid_state
             return
@@ -723,6 +833,9 @@ class FleeBehavior(Node):
         self.ambush_cycles     = 0
         self.confirm_start     = None
         self.confirm_hits      = 0
+        self.check_rear_start  = None
+        self.rear_motion_persist = 0
+        self.prev_scan         = None
         self.recent_sectors.clear()
         self._publish_status('stopped')
 

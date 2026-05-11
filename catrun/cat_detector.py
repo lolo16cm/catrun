@@ -246,23 +246,27 @@ class CatDetector(Node):
         self.latest_status = msg.data.strip().lower()
 
     def _active_feed_name(self):
-        """Pick which feed YOLO should process this tick.
-        - During 'fleeing' or 'checking', use the REAR camera (watch
-          the pursuer behind us).
-        - Otherwise (ambushing/seeking/idle/etc.) use the FRONT camera.
-        - If we don't have play-mode feeds, fall back to legacy.
+        """Pick which feed YOLO should process this tick. Default is
+        front. Switch to rear only when the robot is in one of these
+        states (set by flee_behavior via /seek_status):
+          - 'check_rear'  : LiDAR saw motion behind, verify with camera
+          - 'fleeing'     : running away forward, watch the pursuer
+          - 'checking'    : just stopped after a flee, scan behind first
+        Otherwise (ambushing, seeking, idle, etc.) -> front.
         """
-        in_flee = self.latest_status in ('fleeing', 'checking')
-        if in_flee and self.latest_rear_frame is not None:
+        rear_states = ('check_rear', 'fleeing', 'checking')
+        want_rear = self.latest_status in rear_states
+
+        if want_rear and self.latest_rear_frame is not None:
             return 'rear'
-        if not in_flee and self.latest_front_frame is not None:
+        if not want_rear and self.latest_front_frame is not None:
             return 'front'
-        # Fall back: whichever play-mode feed we have
+
+        # Fallback to whatever we have
         if self.latest_front_frame is not None:
             return 'front'
         if self.latest_rear_frame is not None:
             return 'rear'
-        # No play-mode feeds at all -> watch mode legacy feed
         return 'legacy'
 
     def _front_cb(self, msg: Image):
@@ -324,43 +328,23 @@ class CatDetector(Node):
         self.triggered = False
         self.last_run  = now
 
-        # During "fleeing"/"checking" we only watch the rear camera
-        # (the cat is the threat behind us). In all other states we
-        # watch BOTH cameras - either can spot the threat. This way
-        # the robot reacts to a cat sneaking up from behind during
-        # ambush as well.
-        in_flee = self.latest_status in ('fleeing', 'checking')
-
+        # Only process the currently-active feed. flee_behavior decides
+        # which feed is active via the /seek_status topic:
+        #   front: ambushing, seeking, idle (default)
+        #   rear : check_rear, fleeing, checking
+        active = self._active_feed_name()
         with self.frame_lock:
-            front_frame = self.latest_front_frame
-            rear_frame  = self.latest_rear_frame
-            legacy_frame = self.latest_legacy_frame
-
-        if in_flee:
-            # Only rear feed matters
-            if rear_frame is not None:
-                self._run_detection(rear_frame, camera='rear')
-            elif legacy_frame is not None:
-                self._run_detection(legacy_frame, camera='front')
-        else:
-            # Search states: process BOTH feeds, whichever sees a cat
-            # first triggers the reaction. We alternate which is
-            # processed first on each tick to keep latency symmetric.
-            self._search_tick_parity = getattr(self, '_search_tick_parity', 0) ^ 1
-            if self._search_tick_parity == 0:
-                if front_frame is not None:
-                    self._run_detection(front_frame, camera='front')
-                if rear_frame is not None:
-                    self._run_detection(rear_frame, camera='rear')
+            if active == 'rear':
+                frame = self.latest_rear_frame
+            elif active == 'legacy':
+                frame = self.latest_legacy_frame
             else:
-                if rear_frame is not None:
-                    self._run_detection(rear_frame, camera='rear')
-                if front_frame is not None:
-                    self._run_detection(front_frame, camera='front')
-            # Fall back to legacy feed if neither dual-cam feed is up
-            if (front_frame is None and rear_frame is None
-                    and legacy_frame is not None):
-                self._run_detection(legacy_frame, camera='front')
+                frame = self.latest_front_frame
+
+        if frame is None:
+            return
+
+        self._run_detection(frame, camera=active)
 
     def _run_detection(self, frame: np.ndarray, camera: str = 'front'):
         h, w = frame.shape[:2]
