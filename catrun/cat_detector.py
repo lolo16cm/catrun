@@ -246,27 +246,23 @@ class CatDetector(Node):
         self.latest_status = msg.data.strip().lower()
 
     def _active_feed_name(self):
-        """Pick which feed YOLO should process this tick. Default is
-        front. Switch to rear only when the robot is in one of these
-        states (set by flee_behavior via /seek_status):
-          - 'check_rear'  : LiDAR saw motion behind, verify with camera
-          - 'fleeing'     : running away forward, watch the pursuer
-          - 'checking'    : just stopped after a flee, scan behind first
-        Otherwise (ambushing, seeking, idle, etc.) -> front.
+        """Pick which feed YOLO should process this tick.
+        - During 'fleeing' or 'checking', use the REAR camera (watch
+          the pursuer behind us).
+        - Otherwise (ambushing/seeking/idle/etc.) use the FRONT camera.
+        - If we don't have play-mode feeds, fall back to legacy.
         """
-        rear_states = ('check_rear', 'fleeing', 'checking')
-        want_rear = self.latest_status in rear_states
-
-        if want_rear and self.latest_rear_frame is not None:
+        in_flee = self.latest_status in ('fleeing', 'checking')
+        if in_flee and self.latest_rear_frame is not None:
             return 'rear'
-        if not want_rear and self.latest_front_frame is not None:
+        if not in_flee and self.latest_front_frame is not None:
             return 'front'
-
-        # Fallback to whatever we have
+        # Fall back: whichever play-mode feed we have
         if self.latest_front_frame is not None:
             return 'front'
         if self.latest_rear_frame is not None:
             return 'rear'
+        # No play-mode feeds at all -> watch mode legacy feed
         return 'legacy'
 
     def _front_cb(self, msg: Image):
@@ -325,28 +321,18 @@ class CatDetector(Node):
         now = time.time()
         if not (self.triggered or (now - self.last_run) >= ALWAYS_ON_INTERVAL):
             return
-        self.triggered = False
-        self.last_run  = now
 
-        # Only process the currently-active feed. flee_behavior decides
-        # which feed is active via the /seek_status topic:
-        #   front: ambushing, seeking, idle (default)
-        #   rear : check_rear, fleeing, checking
-        active = self._active_feed_name()
         with self.frame_lock:
-            if active == 'rear':
-                frame = self.latest_rear_frame
-            elif active == 'legacy':
-                frame = self.latest_legacy_frame
-            else:
-                frame = self.latest_front_frame
+            frame = self.latest_frame
 
         if frame is None:
             return
 
-        self._run_detection(frame, camera=active)
+        self.triggered = False
+        self.last_run  = now
+        self._run_detection(frame)
 
-    def _run_detection(self, frame: np.ndarray, camera: str = 'front'):
+    def _run_detection(self, frame: np.ndarray):
         h, w = frame.shape[:2]
         annotated = frame.copy()
         detected_this_frame = None
@@ -462,9 +448,7 @@ class CatDetector(Node):
 
         pt = PointStamped()
         pt.header.stamp    = self.get_clock().now().to_msg()
-        # Encode the camera that saw the cat in frame_id. flee_behavior
-        # uses this to know whether the cat is in front or behind.
-        pt.header.frame_id = f'camera_{camera}'   # 'camera_front' or 'camera_rear'
+        pt.header.frame_id = 'camera'
         pt.point.x = avg_cx
         pt.point.y = avg_cy
         pt.point.z = avg_dist     # actual distance in meters
