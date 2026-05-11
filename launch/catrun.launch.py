@@ -179,8 +179,11 @@ def _build_actions(context, *args, **kwargs):
         ]
     else:  # play
         # PLAY MODE: DUAL camera.
-        #   /camera/front  - CSI sensor 0 (used in ambush/seek/turn)
-        #   /camera/rear   - USB at /dev/video1 (used during flee/check)
+        #   /camera/front  - USB at /dev/video1 (physically pointing FORWARD)
+        #   /camera/rear   - CSI sensor 0       (physically pointing BACKWARD)
+        # NOTE: The cameras were physically swapped on the robot, so we
+        # swap the device->topic mapping here to match. The TOPIC names
+        # (front/rear) reflect physical direction, not which sensor.
         # cat_detector subscribes to BOTH and processes whichever
         # matches the current robot state (from /seek_status).
         # It also mirrors the active feed to /camera/catrun so the
@@ -196,29 +199,31 @@ def _build_actions(context, *args, **kwargs):
             output='screen',
         )
         camera_nodes = [
+            # FRONT (forward-facing) = USB camera at /dev/video1
             Node(
                 package='catrun',
                 executable='camera_node',
                 name='camera_front',
                 parameters=[{
-                    'camera_source': 'csi0',
-                    'flip_method':   2,
+                    'camera_source': 'usb1',
+                    'device_path':   '/dev/video1',
                     'width':         640,
-                    'height':        360,
+                    'height':        480,
                     'framerate':     15,
                     'publish_topic': '/camera/front',
                 }],
                 output='screen',
             ),
+            # REAR (backward-facing) = CSI IMX477 sensor 0
             Node(
                 package='catrun',
                 executable='camera_node',
                 name='camera_rear',
                 parameters=[{
-                    'camera_source': 'usb1',
-                    'device_path':   '/dev/video1',
+                    'camera_source': 'csi0',
+                    'flip_method':   2,
                     'width':         640,
-                    'height':        480,
+                    'height':        360,
                     'framerate':     15,
                     'publish_topic': '/camera/rear',
                 }],
