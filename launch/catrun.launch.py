@@ -50,11 +50,13 @@ INITIAL_POSE_YAW_DEG = 90.0    # 0=+X, 90=+Y, 180=-X, -90=-Y
 # cat plushie at exactly 1 m, reading the bbox= value from the annotated
 # stream, and computing focal_px = bbox_width_at_1m / 0.25.
 #
-# NOTE: When you change camera resolution, focal_px scales linearly.
-# At 1280x720 the calibration was 600. At 640x360 (half), it's ~300.
-# Recalibrate by placing the plushie at 1m and reading the bbox width.
-FRONT_FOCAL_PX = 300.0   # CSI camera at 640x360 - recalibrate for your robot
-REAR_FOCAL_PX  = 500.0   # USB camera at 640x480 - placeholder, please calibrate
+# IMPORTANT: cameras were physically swapped on the robot.
+#   FRONT direction = USB camera at /dev/video1 (used in watch + play front)
+#   REAR  direction = CSI IMX477 (used in play rear)
+# So FRONT_FOCAL_PX should be the USB camera's calibration value, and
+# REAR_FOCAL_PX should be the CSI camera's.
+FRONT_FOCAL_PX = 500.0   # USB camera at 640x480 - PLEASE CALIBRATE for your USB cam
+REAR_FOCAL_PX  = 300.0   # CSI camera at 640x360 - PLEASE CALIBRATE for your CSI cam
 # ────────────────────────────────────────────────────────────────────────
 
 
@@ -147,13 +149,16 @@ def _build_actions(context, *args, **kwargs):
 
     # ─── Mode-specific: camera + detector + behavior ──────────────────
     if mode == 'watch':
-        # WATCH MODE: single front CSI camera publishing to legacy
+        # WATCH MODE: single forward-facing camera publishing to legacy
         # /camera/catrun topic. cat_detector also subscribes to that.
+        # NOTE: Cameras were physically swapped on the robot. The USB
+        # camera at /dev/video1 now points FORWARD - that's the one we
+        # want for watch mode (find a cat ahead, follow it).
         camera_params = {
-            'camera_source': 'csi0',
-            'flip_method':   2,
+            'camera_source': 'usb1',
+            'device_path':   '/dev/video1',
             'width':         640,
-            'height':        360,
+            'height':        480,
             'framerate':     15,
             'publish_topic': '/camera/catrun',
         }
