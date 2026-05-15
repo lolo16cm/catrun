@@ -3,9 +3,6 @@
 classifier.py
 Cat identity classifier (eevee / pichu / raichu) — MobileNetV2 transfer learning.
 
-This version is rewritten for the ML coursework report. Compared to the
-original training script, this version:
-
   1. Creates a proper train / val / test split from a single source folder,
      instead of relying on a pre-existing train/val that mixed the roles of
      validation and test.
@@ -24,9 +21,6 @@ original training script, this version:
   6. Saves a JSON log of every run to results.json so the report numbers
      come from one verifiable source.
 
-Run on WSL with an NVIDIA GPU. Expected runtime on a single GPU:
-roughly 30 minutes for the full sweep (3 learning rates x 3 seeds x
-30 epochs each), depending on dataset size and hardware.
 """
 import json
 import os
